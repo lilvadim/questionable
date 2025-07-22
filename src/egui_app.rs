@@ -9,7 +9,6 @@ use crate::util::chrono::to_local_date_time;
 use crate::util::egui::item_spacing;
 use egui::CollapsingHeader;
 use egui::Color32;
-use egui::Modal;
 use rust_i18n::t;
 
 use std::sync::{Arc, LazyLock};
@@ -93,7 +92,7 @@ impl NotesApp {
 }
 
 impl eframe::App for NotesApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &eframe::egui::Context, _frame: &mut eframe::Frame) {
         // if ctx.input(|i| i.viewport().fullscreen.is_none_or(|fullscreen| !fullscreen)) {
         //     TopBottomPanel::top("native_title_bar_padding_panel")
         //         .frame(Frame::side_top_panel(&ctx.style()).inner_margin(0.))
@@ -345,9 +344,7 @@ impl NotesApp {
                             ui.horizontal(|ui| {
                                 CollapsingHeader::new(&folder.name)
                                     .id_salt(&folder.id)
-                                    .show(ui, |ui| {
-                                        self.state.notes.get_sub_folders(&folder.id);
-                                    });
+                                    .show(ui, |_ui| {});
                             });
                         });
                 });
