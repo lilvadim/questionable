@@ -19,7 +19,7 @@ use chrono::Utc;
 use egui::{self, Label, RichText, ScrollArea, TextEdit, TextStyle, Ui, panel::Side};
 use egui::{
     Align, Button, Context, FontData, FontDefinitions, FontFamily, Frame, Layout, Margin,
-    SelectableLabel, TopBottomPanel, Widget, Window,
+    TopBottomPanel, Widget, Window,
 };
 
 fn gen_sample_notes(count: i32) -> Vec<String> {
@@ -111,7 +111,7 @@ impl eframe::App for NotesApp {
             .show(ctx, |ui| {
                 ui.horizontal_top(|ui| {
                     if ui.input(|i| i.modifiers.ctrl) || self.ui_state.egui_settings {
-                        if SelectableLabel::new(self.ui_state.egui_settings, phosphor::WRENCH)
+                        if Button::selectable(self.ui_state.egui_settings, phosphor::WRENCH)
                             .ui(ui)
                             .on_hover_text("Egui Tweaks")
                             .clicked()
@@ -119,14 +119,14 @@ impl eframe::App for NotesApp {
                             self.ui_state.egui_settings = !self.ui_state.egui_settings;
                         }
                     }
-                    if SelectableLabel::new(self.ui_state.explorer, phosphor::LIST_DASHES)
+                    if Button::selectable(self.ui_state.explorer, phosphor::LIST_DASHES)
                         .ui(ui)
                         .on_hover_text(t!("explorer"))
                         .clicked()
                     {
                         self.ui_state.explorer = !self.ui_state.explorer
                     }
-                    if SelectableLabel::new(self.ui_state.trash, phosphor::TRASH)
+                    if Button::selectable(self.ui_state.trash, phosphor::TRASH)
                         .ui(ui)
                         .on_hover_text(t!("trash"))
                         .clicked()
@@ -527,7 +527,7 @@ fn trash_label_ui(
             .clicked()
         {
             *restore = true;
-            ui.close_menu();
+            ui.close();
         }
     });
     if label.clicked() {
@@ -549,7 +549,7 @@ fn explorer_note_label_ui(
             .clicked()
         {
             *remove = true;
-            ui.close_menu();
+            ui.close();
         }
     });
     if label.clicked() {
@@ -558,12 +558,12 @@ fn explorer_note_label_ui(
     label
 }
 
-fn note_label(selected: bool, note: &Note) -> SelectableLabel {
+fn note_label(selected: bool, note: &Note) -> Button {
     let mut label_text = RichText::new(format!("{} {}", note.icon(), &note.content.name));
 
     if selected {
         label_text = label_text.strong();
     }
 
-    SelectableLabel::new(selected, label_text)
+    Button::selectable(selected, label_text)
 }
