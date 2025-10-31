@@ -1,220 +1,263 @@
-use std::{
-    collections::{HashMap, hash_map::Entry},
-    hash::Hash,
+use std::{collections::HashMap, hash::Hash};
+
+use chrono::{DateTime, Utc};
+
+use crate::{
+    id_gen::{AtomicTimestampRandIdGen, IdGen},
+    tree_like::TreeLike,
+    util::generate_unique_name,
 };
 
+pub type ObjectId = u64;
+
 #[derive(Debug)]
-pub struct TreeLike<Key, Value> {
-    pub root: Key,
-    parent_to_child: HashMap<Key, Vec<Key>>,
-    child_to_parent: HashMap<Key, Key>,
-    key_to_value: HashMap<Key, Value>,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub struct NodeRef<'value, Key, Value> {
-    pub key: Key,
-    pub value: &'value Value,
-    pub children: Vec<Key>,
-    pub parent: Option<Key>,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub struct NodeMut<'value, Key, Value> {
-    pub key: Key,
-    pub value: &'value mut Value,
-    pub children: Vec<Key>,
-    pub parent: Option<Key>,
-}
-
-impl<Key: Hash + Eq + Clone, Value> TreeLike<Key, Value> {
-    pub fn with_root(key: Key, value: Value) -> Self {
-        Self {
-            root: key.clone(),
-            parent_to_child: Default::default(),
-            child_to_parent: Default::default(),
-            key_to_value: HashMap::from_iter([(key, value)]),
-        }
-    }
-
-    pub fn add_node(&mut self, parent: &Key, key_value: impl Into<(Key, Value)>) -> &mut Self {
-        let (key, value) = key_value.into();
-        self.key_to_value.insert(key.clone(), value);
-        self.child_to_parent.insert(key.clone(), parent.clone());
-        match self.parent_to_child.entry(parent.clone()) {
-            Entry::Vacant(entry) => entry.insert(Vec::new()).push(key),
-            Entry::Occupied(entry) => entry.into_mut().push(key),
-        }
-        self
-    }
-
-    pub fn root_add_node(&mut self, key_value: impl Into<(Key, Value)>) {
-        self.add_node(&self.root.clone(), key_value);
-    }
-
-    pub fn get_node(&self, key: &Key) -> Option<NodeRef<Key, Value>> {
-        let value = self.key_to_value.get(&key)?;
-        let children = self
-            .parent_to_child
-            .get(&key)
-            .cloned()
-            .unwrap_or_else(|| Vec::new());
-        let parent = self.child_to_parent.get(&key).cloned();
-
-        Some(NodeRef {
-            key: key.clone(),
-            value,
-            children,
-            parent,
-        })
-    }
-
-    pub fn get_node_mut(&mut self, key: &Key) -> Option<NodeMut<Key, Value>> {
-        let value: &mut Value = self.key_to_value.get_mut(&key)?;
-        let children = self
-            .parent_to_child
-            .get(&key)
-            .cloned()
-            .unwrap_or_else(|| Vec::new());
-        let parent = self.child_to_parent.get(&key).cloned();
-
-        Some(NodeMut {
-            key: key.clone(),
-            value,
-            children,
-            parent,
-        })
-    }
-
-    pub fn root_node(&self) -> NodeRef<Key, Value> {
-        self.get_node(&self.root).expect("Root must be present")
-    }
-
-    pub fn root_node_mut(&mut self) -> NodeMut<Key, Value> {
-        self.get_node_mut(&self.root.clone())
-            .expect("Root must be present")
-    }
-
+pub struct DataNode<Value, Key = ObjectId> {
+    id: Key,
+    pub data: Value,
     #[allow(dead_code)]
-    pub fn remove_subtree(&mut self, key: &Key) -> Option<TreeLike<Key, Value>> {
-        let value = self.key_to_value.remove(&key)?;
-        self.child_to_parent.remove(key);
-        let children = self.parent_to_child.remove(key).unwrap_or(Vec::new());
-        let mut children_removed = children
-            .iter()
-            .map(|child| self.remove_subtree(child))
-            .flatten()
-            .collect::<Vec<TreeLike<Key, Value>>>();
-        Some(Self {
-            root: key.clone(),
-            parent_to_child: children_removed
-                .iter()
-                .map(|child| child.parent_to_child.clone())
-                .reduce(|acc, next| acc.into_iter().chain(next).collect())
-                .unwrap_or(HashMap::new()),
-            child_to_parent: children_removed
-                .iter()
-                .map(|child| child.child_to_parent.clone())
-                .reduce(|acc, next| acc.into_iter().chain(next).collect())
-                .unwrap_or(HashMap::new()),
-            key_to_value: children_removed
-                .iter_mut()
-                .map(|child| {
-                    let keys = child.key_to_value.keys().cloned().collect::<Vec<Key>>();
-                    (keys, &mut child.key_to_value)
-                })
-                .map(|(keys, map)| {
-                    keys.into_iter().map(|key| {
-                        let value = map.remove(&key).expect("Value must be present");
-                        (key, value)
-                    })
-                })
-                .flatten()
-                .chain([(key.clone(), value)])
-                .collect(),
-        })
-    }
+    pub creation_time: DateTime<Utc>,
+    pub modification_time: DateTime<Utc>,
+    pub deletion_time: Option<DateTime<Utc>>,
+}
 
-    pub fn node_values(&self) -> impl Iterator<Item = &Value> {
-        self.key_to_value.values()
-    }
+#[derive(Debug, Clone, Copy)]
+pub struct DirNode<Key = ObjectId> {
+    dir_obj_id: Key,
+}
 
-    pub fn node_values_mut(&mut self) -> impl Iterator<Item = &mut Value> {
-        self.key_to_value.values_mut()
+impl<K: Copy + Clone> DirNode<K> {
+    pub fn dir_id(&self) -> K {
+        self.dir_obj_id
+    }
+    pub fn new(dir_obj_id: K) -> Self {
+        Self { dir_obj_id }
     }
 }
 
-#[cfg(test)]
-mod tree_like_test {
-    use super::*;
-    use crate::{note::Note, note_folder::NoteFolder};
-
-    fn create_tree() -> (TreeLike<u64, NoteFolder>, u64, u64, u64) {
-        let root_val = NoteFolder::empty("root".to_owned());
-        let root_key = root_val.id;
-
-        let mut tree = TreeLike::with_root(root_key.clone(), root_val.clone());
-
-        let child_val = NoteFolder::empty("child".to_owned());
-        let child_key = child_val.id;
-        tree.add_node(&root_key, child_val.clone());
-
-        let child_val1 = NoteFolder::empty("child1".to_owned());
-        let child_key1 = child_val1.id;
-        tree.add_node(&child_key, child_val1);
-
-        (tree, root_key, child_key, child_key1)
+impl<V> DataNode<V> {
+    fn new(value: V) -> Self {
+        let now = Utc::now();
+        Self {
+            id: AtomicTimestampRandIdGen::new().next(),
+            data: value,
+            creation_time: now,
+            modification_time: now,
+            deletion_time: None,
+        }
     }
 
-    #[test]
-    fn example() {
-        let root_val = NoteFolder::empty("root".to_owned());
-        let root_key = root_val.id;
-
-        let mut tree = TreeLike::with_root(root_key.clone(), root_val.clone());
-
-        let root_node = tree.get_node(&root_key);
-
-        assert_eq!(&root_val, root_node.unwrap().value);
-
-        let child_val = NoteFolder::empty("child".to_owned());
-        let child_key = child_val.id;
-
-        tree.add_node(&root_key, child_val.clone());
-        let node = tree.get_node(&child_val.id).unwrap();
-        let parent_node = tree.get_node(&node.parent.unwrap()).unwrap();
-
-        assert_eq!(&child_val, node.value);
-        assert_eq!(&child_key, parent_node.children.first().unwrap());
-        assert_eq!(&root_val, parent_node.value);
-
-        let root_node = tree.get_node(&node.parent.unwrap()).unwrap();
-        assert_eq!(root_node.children.first().unwrap(), &child_val.id);
-
-        let child_val1 = NoteFolder::empty("child".to_owned());
-        tree.add_node(&child_key, child_val1);
+    pub fn touch(&mut self) {
+        self.modification_time = Utc::now();
     }
 
-    #[test]
-    fn values_search_by_field() {
-        let (tree, ..) = create_tree();
-        let result = tree
-            .node_values()
-            .find(|folder| folder.name == "child")
-            .unwrap();
-        assert_eq!("child", result.name);
+    pub fn delete(&mut self) {
+        self.deletion_time = Some(Utc::now());
     }
 
-    #[test]
-    fn values_search_map_result() {
-        let (mut tree, _root, child, ..) = create_tree();
-        let note = Note::new();
-        let note_id = note.id;
-        tree.get_node_mut(&child).unwrap().value.put(note_id, note);
-        let result = tree
-            .node_values()
-            .find_map(|folder| folder.get(note_id))
-            .unwrap();
-        assert_eq!(note_id, result.id);
+    pub fn restore(&mut self) {
+        self.deletion_time = None;
+    }
+
+    pub fn is_deleted(&self) -> bool {
+        self.deletion_time.is_some()
+    }
+}
+
+impl<V, K: Copy + Clone> DataNode<V, K> {
+    pub fn id(&self) -> K {
+        self.id
+    }
+}
+
+impl<V> AsRef<V> for DataNode<V> {
+    fn as_ref(&self) -> &V {
+        &self.data
+    }
+}
+
+#[derive(Debug)]
+pub struct Directory<Key = ObjectId> {
+    pub name: String,
+    pub entries: HashMap<String, Key>,
+}
+
+#[derive(Debug)]
+pub enum DataType<V> {
+    Dir(Directory),
+    File(V),
+}
+
+pub fn as_dir<V>(data: &DataType<V>) -> Option<&Directory> {
+    match data {
+        DataType::Dir(dir) => Some(dir),
+        _ => None,
+    }
+}
+pub fn as_dir_mut<V>(data: &mut DataType<V>) -> Option<&mut Directory> {
+    match data {
+        DataType::Dir(dir) => Some(dir),
+        _ => None,
+    }
+}
+impl<K: Eq + Hash> Directory<K> {
+    pub fn with_name(name: String) -> Self {
+        Self {
+            name,
+            entries: HashMap::new(),
+        }
+    }
+    pub fn get_new_unique_name(&self, new_name: String) -> String {
+        generate_unique_name(self.entries.keys().map(|it| it.as_str()), new_name)
+    }
+
+    pub fn add_entry_with_unique_name(&mut self, id: K, name: String) {
+        let name = self.get_new_unique_name(name);
+        self.entries.insert(name, id);
+    }
+}
+
+#[derive(Debug)]
+pub struct Storage<V> {
+    dir_tree: TreeLike<ObjectId, DirNode>,
+    objects: HashMap<ObjectId, DataNode<DataType<V>>>,
+}
+
+impl<V> Storage<V> {
+    pub fn with_root(root: Directory) -> Self {
+        let root = DataNode::new(DataType::Dir(root));
+        let root_dir_node = DirNode::new(root.id);
+        Self {
+            dir_tree: TreeLike::with_root(root.id, root_dir_node),
+            objects: HashMap::from_iter([(root.id, root)]),
+        }
+    }
+
+    pub fn root_dir(&self) -> &Directory {
+        let id = self.dir_tree.root_node().value.dir_obj_id;
+        self.objects
+            .get(&id)
+            .map(|obj| as_dir(&obj.data).expect("Root must be dir"))
+            .expect("Root Dir must be in storage")
+    }
+
+    pub fn root_dir_id(&self) -> ObjectId {
+        self.dir_tree.root
+    }
+
+    pub fn root_dir_mut(&mut self) -> &mut Directory {
+        let id = self.dir_tree.root_node().value.dir_obj_id;
+        self.objects
+            .get_mut(&id)
+            .map(|obj| as_dir_mut(&mut obj.data).expect("Root must be dir"))
+            .expect("Root Dir must be in storage")
+    }
+
+    pub fn get_dir_parent_id(&self, dir_id: ObjectId) -> Option<ObjectId> {
+        self.dir_tree
+            .get_node(dir_id)
+            .and_then(|node| node.parent)
+    }
+
+    pub fn get_object(&self, id: ObjectId) -> Option<&DataNode<DataType<V>>> {
+        self.objects.get(&id)
+    }
+
+    pub fn get_object_mut(&mut self, id: ObjectId) -> Option<&mut DataNode<DataType<V>>> {
+        self.objects.get_mut(&id)
+    }
+
+    pub fn find_file_dir(&self, file_id: ObjectId) -> Option<&DataNode<DataType<V>>> {
+        self.objects
+            .values()
+            .filter_map(|node| match &node.data {
+                DataType::Dir(dir) => dir
+                    .entries
+                    .values()
+                    .any(|dir_entry_link| *dir_entry_link == file_id)
+                    .then_some(node),
+                _ => None,
+            })
+            .next()
+    }
+
+    pub fn find_file_dir_mut(&mut self, file_id: ObjectId) -> Option<&mut DataNode<DataType<V>>> {
+        self.objects
+            .values_mut()
+            .filter_map(|node| match &node.data {
+                DataType::Dir(dir) => dir
+                    .entries
+                    .values()
+                    .any(|dir_entry_link| *dir_entry_link == file_id)
+                    .then_some(node),
+                _ => None,
+            })
+            .next()
+    }
+
+    pub fn add_dir(&mut self, parent_dir_id: ObjectId, dir: Directory) -> ObjectId {
+        let node = DataNode::new(DataType::<V>::Dir(dir));
+        let dir_node = DirNode::new(node.id);
+        let id = node.id;
+        self.objects.insert(id, node);
+        self.dir_tree
+            .add_node(parent_dir_id, (dir_node.dir_obj_id, dir_node))
+            .ok()
+            .expect("Parent must be in tree when add dir");
+        id
+    }
+
+    pub fn add_object(&mut self, object: V) -> ObjectId {
+        let node = DataNode::new(DataType::File(object));
+        let id = node.id;
+        self.objects.insert(node.id, node);
+        id
+    }
+
+    pub fn get_object_path(&self, id: ObjectId) -> Option<Vec<&DirNode>> {
+        let mut path = Vec::new();
+        let parent_dir = self
+            .find_file_dir(id)
+            .and_then(|node| self.dir_tree.get_node(node.id))?;
+        let mut node = Some(parent_dir);
+        while node.is_some() {
+            let unwraped = node.unwrap();
+            path.push(unwraped.value);
+            if let Some(parent) = unwraped.parent {
+                node = self.dir_tree.get_node(parent);
+            } else {
+                node = None;
+            }
+        }
+        path.reverse();
+        Some(path)
+    }
+
+    pub fn dir_objects(&self, dir_id: ObjectId) -> Option<Vec<(&str, &DataNode<DataType<V>>)>> {
+        self.objects
+            .get(&dir_id)
+            .and_then(|dir| match &dir.data {
+                DataType::Dir(dir) => dir
+                    .entries
+                    .iter()
+                    .map(|(name, id)| {
+                        (
+                            name.as_str(),
+                            self.objects.get(id).expect("Must be in storage"),
+                        )
+                    })
+                    .collect::<Vec<(&str, &DataNode<DataType<V>>)>>()
+                    .into(),
+                _ => None,
+            })
+    }
+
+    pub fn get_sub_directories(&self, dir_id: ObjectId) -> Option<Vec<&DataNode<DataType<V>>>> {
+        self.dir_tree.get_children(dir_id).map(|children| {
+            children
+                .iter()
+                .map(|&id| self.objects.get(&id).expect("Child must be in tree"))
+                .filter(|&n| !n.is_deleted())
+                .collect()
+        })
     }
 }

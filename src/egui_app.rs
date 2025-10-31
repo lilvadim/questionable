@@ -1,14 +1,19 @@
 use crate::app::AppState;
 use crate::app::ContentLookup;
+use crate::app::DisplayType;
 use crate::app::NoteLookup;
+use crate::app::as_note;
 use crate::font_icons::phosphor;
 use crate::note::Note;
-use crate::note_tree::NoteFolderTree;
-use crate::trash::Trashed;
+use crate::note::SCRATCH_PAD_NAME;
+use crate::storage::Directory;
+use crate::storage::ObjectId;
+use crate::storage::as_dir;
 use crate::util::chrono::to_local_date_time;
 use crate::util::egui::item_spacing;
 use egui::CollapsingHeader;
 use egui::Color32;
+use egui::Popup;
 use rust_i18n::t;
 
 use std::sync::{Arc, LazyLock};
@@ -22,15 +27,9 @@ use egui::{
     TopBottomPanel, Widget, Window,
 };
 
-fn gen_sample_notes(count: i32) -> Vec<String> {
-    (0..count)
-        .map(|number| format!("Note {}", number))
-        .collect()
-}
-
 fn gen_sample_text(lines_count: i32) -> String {
     (0..lines_count)
-        .map(|number| format!("Sample text line. The line number is {}\n", number))
+        .map(|number| format!("Sample text line. The line number is {number}\n"))
         .collect()
 }
 
@@ -66,26 +65,33 @@ impl Default for UiState {
     }
 }
 
+#[derive(Debug)]
+enum ExplorerAction {
+    FolderTarget(FolderAction),
+    NoteTarget(NoteAction),
+}
+
+#[derive(Debug)]
+enum FolderAction {
+    CreateSubFolder(ObjectId),
+    CreateNote(ObjectId),
+    CreateNoteThenSelect(ObjectId),
+    Delete(ObjectId),
+}
+
+#[derive(Debug)]
+enum NoteAction {
+    Select(ObjectId),
+    Delete(String, ObjectId),
+}
+
 /// Create demo instance
 impl NotesApp {
     pub fn demo() -> Self {
-        let notes: Vec<Note> = gen_sample_notes(10)
-            .iter()
-            .map(|name| Note::with_name(name.to_owned()))
-            .collect();
-        let notes = NoteFolderTree::with_items(notes);
-
-        let mut note_with_text = Note::scratch_pad();
-        let current_note_id = note_with_text.id;
-        note_with_text.content.text = gen_sample_text(100);
-
+        let mut state = AppState::initial();
+        state.scratch_pad_mut().text = gen_sample_text(100);
         Self {
-            state: AppState {
-                current_note_id,
-                scratch_pad: note_with_text,
-                notes,
-                trash: Default::default(),
-            },
+            state,
             ui_state: Default::default(),
         }
     }
@@ -110,14 +116,13 @@ impl eframe::App for NotesApp {
             )
             .show(ctx, |ui| {
                 ui.horizontal_top(|ui| {
-                    if ui.input(|i| i.modifiers.ctrl) || self.ui_state.egui_settings {
-                        if Button::selectable(self.ui_state.egui_settings, phosphor::WRENCH)
+                    if (ui.input(|i| i.modifiers.ctrl) || self.ui_state.egui_settings)
+                        && Button::selectable(self.ui_state.egui_settings, phosphor::WRENCH)
                             .ui(ui)
                             .on_hover_text("Egui Tweaks")
                             .clicked()
-                        {
-                            self.ui_state.egui_settings = !self.ui_state.egui_settings;
-                        }
+                    {
+                        self.ui_state.egui_settings = !self.ui_state.egui_settings;
                     }
                     if Button::selectable(self.ui_state.explorer, phosphor::LIST_DASHES)
                         .ui(ui)
@@ -184,7 +189,6 @@ impl eframe::App for NotesApp {
                             });
                             self.explorer_ui(ui)
                         });
-                    ()
                 }
                 ExplorerLayout::SideBar => {
                     egui::SidePanel::new(Side::Left, "explorer_side_bar").show(ctx, |ui| {
@@ -198,7 +202,6 @@ impl eframe::App for NotesApp {
                         }
                         self.explorer_ui(ui);
                     });
-                    ()
                 }
             }
         }
@@ -300,79 +303,185 @@ impl NotesApp {
 
     fn explorer_ui(&mut self, ui: &mut Ui) {
         ui.with_layout(Layout::top_down(Align::LEFT), |ui| {
-            let mut note_id_to_remove = None;
-
+            let mut explorer_action = None;
             ScrollArea::vertical()
                 .stick_to_bottom(false)
                 .show(ui, |ui| {
-                    let note = &self.state.scratch_pad;
-                    let selected = self.state.current_note_id == note.id;
-                    if ui.add(note_label(selected, note)).clicked() {
-                        self.state.current_note_id = note.id;
+                    {
+                        let (note_id, note) =
+                            (self.state.scratch_pad_id, &self.state.scratch_pad());
+                        let selected = self.state.current_note_id == note_id;
+                        if ui
+                            .add(scratch_pad_label(selected, SCRATCH_PAD_NAME, note))
+                            .clicked()
+                        {
+                            explorer_action =
+                                ExplorerAction::NoteTarget(NoteAction::Select(note_id)).into();
+                        }
                     }
 
                     ui.separator();
-                    if ui
-                        .button(format!("{} {}", phosphor::PLUS, t!("new_note")))
-                        .clicked()
-                    {
-                        self.state.new_note_then_switch();
-                    }
-                    if ui
-                        .button(format!("{} {}", phosphor::PLUS, t!("new_folder")))
-                        .clicked()
-                    {
-                        self.state.new_folder("New folder".to_owned());
-                    }
-                    self.state.notes.root_folder().iter().for_each(|note| {
-                        let mut selected = self.state.current_note_id == note.id;
-                        let mut remove = false;
-                        explorer_note_label_ui(ui, &mut selected, &mut remove, note);
-                        if selected {
-                            self.state.current_note_id = note.id;
+                    let folder_action =
+                        create_action_buttons_ui(ui, self.state.storage.root_dir_id());
+                    // in root switch to created note
+                    let folder_action = folder_action.map(|action| match action {
+                        FolderAction::CreateNote(folder) => {
+                            FolderAction::CreateNoteThenSelect(folder)
                         }
-                        if remove {
-                            note_id_to_remove = Some(note.id);
-                        }
+                        _ => action,
                     });
-                    self.state
-                        .notes
-                        .get_sub_folders(&self.state.notes.root_folder().id)
-                        .unwrap()
-                        .for_each(|folder| {
-                            // TODO: collapsible heading label
-                            ui.horizontal(|ui| {
-                                CollapsingHeader::new(&folder.name)
-                                    .id_salt(&folder.id)
-                                    .show(ui, |_ui| {});
-                            });
-                        });
+                    if let Some(action) = folder_action {
+                        explorer_action = Some(ExplorerAction::FolderTarget(action));
+                    }
+
+                    self.explorer_folder_content_ui(
+                        ui,
+                        self.state.storage.root_dir_id(),
+                        self.state.storage.root_dir(),
+                        &mut explorer_action,
+                    );
                 });
 
-            if let Some(note_id) = note_id_to_remove {
-                self.state.trash_note(note_id);
+            if let Some(action) = explorer_action {
+                self.handle_explorer_action(action)
             }
+        });
+    }
+
+    fn handle_explorer_action(&mut self, action: ExplorerAction) {
+        match action {
+            ExplorerAction::NoteTarget(NoteAction::Select(note_id)) => {
+                self.state.current_note_id = note_id
+            }
+            ExplorerAction::NoteTarget(NoteAction::Delete(item_name, item_id)) => {
+                self.state.delete_object(item_id, item_name)
+            }
+            ExplorerAction::FolderTarget(FolderAction::CreateSubFolder(parent_folder_id)) => {
+                self.state.new_folder(parent_folder_id)
+            }
+            ExplorerAction::FolderTarget(FolderAction::CreateNote(parent_folder_id)) => {
+                self.state.new_note(parent_folder_id)
+            }
+            ExplorerAction::FolderTarget(FolderAction::CreateNoteThenSelect(folder_id)) => {
+                self.state.new_note_then_switch(folder_id)
+            }
+            ExplorerAction::FolderTarget(FolderAction::Delete(folder_id)) => {
+                self.state.delete_dir(folder_id);
+            }
+        }
+    }
+
+    fn explorer_folder_ui(
+        &self,
+        ui: &mut Ui,
+        folder_id: ObjectId,
+        folder: &Directory,
+        action: &mut Option<ExplorerAction>,
+    ) {
+        ui.horizontal(|ui| {
+            let collapsing =
+                CollapsingHeader::new(&folder.name)
+                    .id_salt(folder_id)
+                    .show(ui, |ui| {
+                        self.explorer_folder_content_ui(ui, folder_id, folder, action);
+                    });
+            [Some(collapsing.header_response), collapsing.body_response]
+                .iter()
+                .flatten()
+                .for_each(|response| {
+                    Popup::context_menu(response).show(|ui| {
+                        let folder_action = folder_action_buttons_ui(ui, folder_id);
+                        *action = folder_action;
+                    });
+                });
+        });
+    }
+
+    fn explorer_folder_content_ui(
+        &self,
+        ui: &mut Ui,
+        folder_id: ObjectId,
+        folder: &Directory,
+        action: &mut Option<ExplorerAction>,
+    ) {
+        let show_deleted = folder_id == self.state.trash_dir_id;
+        let mut notes = folder
+            .entries
+            .iter()
+            .map(|(name, &id)| (name.as_str(), id))
+            .collect::<Vec<(&str, ObjectId)>>();
+        notes.sort();
+        notes
+            .into_iter()
+            .map(|(note_name, note_id)| {
+                (
+                    note_id,
+                    note_name,
+                    self.state.storage.get_object(note_id).unwrap(),
+                )
+            })
+            .filter(|(_, _, node)| node.is_deleted() == show_deleted)
+            .map(|(id, name, node)| (id, name, as_note(&node.data).expect("Must be note")))
+            .for_each(|(note_id, note_name, node)| {
+                let was_selected = self.state.current_note_id == note_id;
+                let mut selected = was_selected;
+                let mut remove = false;
+                explorer_note_label_ui(ui, &mut selected, &mut remove, note_name, node);
+                if selected && !was_selected {
+                    *action = ExplorerAction::NoteTarget(NoteAction::Select(note_id)).into();
+                }
+                if remove {
+                    *action = ExplorerAction::NoteTarget(NoteAction::Delete(
+                        note_name.to_owned(),
+                        note_id,
+                    ))
+                    .into();
+                }
+            });
+        let mut sub_folders = self.state.storage.get_sub_directories(folder_id).unwrap();
+        sub_folders
+            .sort_by_key(|folder| as_dir(&folder.data).expect("Must be dir").name.to_owned());
+        sub_folders.into_iter().for_each(|sub_folder| {
+            self.explorer_folder_ui(
+                ui,
+                sub_folder.id(),
+                as_dir(&sub_folder.data).expect("Must be dir"),
+                action,
+            );
         });
     }
 
     fn status_bar_ui(&self, ui: &mut Ui) {
         let layout = Layout::left_to_right(Align::TOP).with_main_align(Align::LEFT);
-        ui.with_layout(layout, |ui| match self.state.lookup_current_note() {
-            NoteLookup::Default(note) | NoteLookup::ScratchPad(note) => {
-                let text = format!("{} {}", &note.icon(), &note.content.name);
-                Label::new(RichText::new(text)).selectable(false).ui(ui);
-            }
-            NoteLookup::Trashed(Trashed { item, .. }) => {
-                let text = format!(
-                    "{} {} / {} {}",
-                    phosphor::TRASH,
-                    t!("trash"),
-                    &item.icon(),
-                    &item.content.name
-                );
-                Label::new(RichText::new(text).color(Color32::RED))
-                    .selectable(false)
-                    .ui(ui);
+        let current_note_id = self.state.current_note_id;
+        ui.with_layout(layout, |ui| {
+            let current = self.state.lookup_current_note();
+            let note = &current.note;
+            match current.display_type {
+                DisplayType::Default => {
+                    let path = self
+                        .state
+                        .get_item_path_str(current_note_id)
+                        .expect("Path for note in tree must be present");
+                    let text = format!("{}/ {} {}", path, &note.icon(), &note.title);
+                    Label::new(RichText::new(text)).selectable(false).ui(ui);
+                }
+                DisplayType::ScratchPad => {
+                    let text = format!("{} {}", &note.icon(), &note.title);
+                    Label::new(RichText::new(text)).selectable(false).ui(ui);
+                }
+                DisplayType::Deleted => {
+                    let text = format!(
+                        "{} {} / {} {}",
+                        phosphor::TRASH,
+                        t!("trash"),
+                        &note.icon(),
+                        &note.title
+                    );
+                    Label::new(RichText::new(text).color(Color32::RED))
+                        .selectable(false)
+                        .ui(ui);
+                }
             }
         });
     }
@@ -380,17 +489,28 @@ impl NotesApp {
     fn title_ui(&mut self, ui: &mut Ui) {
         let layout = Layout::top_down_justified(Align::LEFT);
         ui.with_layout(layout, |ui| {
-            let note = self.state.current_note();
+            let current_note_id = self.state.current_note_id;
+            let node = self
+                .state
+                .storage
+                .get_object(current_note_id)
+                .expect("Must be in storage");
+            let note = as_note(&node.data).expect("Must be note");
 
-            let mod_date = format_date_time(&note.modification_time);
+            self.state.get_item_path_str(current_note_id).map(|path| {
+                ui.weak(path);
+                ui.add_space(item_spacing(ui.ctx(), &layout));
+            });
+
+            let mod_date = format_date_time(&node.modification_time);
             ui.weak(format!("{} {}", t!("modified"), mod_date));
 
             ui.add_space(item_spacing(ui.ctx(), &layout));
 
             let icon_label = Label::new(RichText::new(note.icon()).heading());
             let title_text = match self.state.lookup_current_note_content() {
-                ContentLookup::Mut(content) => &mut content.name,
-                ContentLookup::Immut(content) => &mut content.name.clone(),
+                ContentLookup::Mut(content) => &mut content.title,
+                ContentLookup::Immut(content) => &mut content.title.clone(),
             };
             let title_text_edit = TextEdit::singleline(title_text)
                 .desired_rows(1)
@@ -420,8 +540,17 @@ impl NotesApp {
     fn note_content_ui(&mut self, ui: &mut Ui) {
         let scroll_area = ScrollArea::both().stick_to_bottom(false).show(ui, |ui| {
             ui.add_space(ui.spacing().item_spacing.y);
-            if let NoteLookup::Trashed(trashed) = self.state.lookup_current_note() {
-                let trash_put_time = format_date_time(&trashed.put_time);
+            if let NoteLookup {
+                node,
+                note,
+                display_type: DisplayType::Deleted,
+            } = self.state.lookup_current_note()
+            {
+                let trash_put_time = format_date_time(
+                    &node
+                        .deletion_time
+                        .expect("Deletion time must be present as node is deleted"),
+                );
                 ui.label(
                     RichText::new(format!(
                         "{} {} {}",
@@ -439,19 +568,22 @@ impl NotesApp {
                     ))
                     .clicked()
                 {
-                    self.state.restore_note(trashed.item.id);
+                    self.state.restore_object(node.id());
                 }
             }
 
-            let mutable = self.state.lookup_current_note_content().is_mut();
+            let content = self.state.lookup_current_note_content();
+            let mutable = content.is_mut();
             ui.add_enabled_ui(mutable, |ui| {
                 self.title_ui(ui);
                 ui.separator();
 
-                let note_text = match self.state.lookup_current_note_content() {
+                let content = self.state.lookup_current_note_content();
+                let note_text = match content {
                     ContentLookup::Mut(content) => &mut content.text,
                     ContentLookup::Immut(content) => &mut content.text.clone(),
                 };
+
                 if TextEdit::multiline(note_text)
                     .interactive(mutable)
                     .desired_width(f32::INFINITY)
@@ -477,46 +609,27 @@ impl NotesApp {
             .collapsible(true)
             .vscroll(true)
             .open(&mut self.ui_state.trash)
-            .show(ctx, |ui| {
-                let mut note_id_to_restore = None;
-
-                self.state.trash.values().into_iter().for_each(|trashed| {
-                    let mut selected = self.state.current_note_id == trashed.item.id;
-                    let mut restore = false;
-                    trash_label_ui(ui, &mut selected, &mut restore, trashed);
-                    if selected {
-                        self.state.current_note_id = trashed.item.id;
-                    }
-                    if restore {
-                        note_id_to_restore = Some(trashed.item.id);
-                    }
-                });
-                if let Some(note_id) = note_id_to_restore {
-                    self.state.restore_note(note_id);
-                }
-            });
+            .show(ctx, |ui| { /*TODO*/ });
     }
 }
 
 fn date_time_fmt() -> &'static str {
     static DATE_TIME_FMT: LazyLock<String> =
         std::sync::LazyLock::new(|| format!("%d.%m.%Y {} %H:%M", t!("at")));
-    &*DATE_TIME_FMT
+    &DATE_TIME_FMT
 }
 
 fn format_date_time(date: &DateTime<Utc>) -> String {
-    to_local_date_time(date)
-        .format(&date_time_fmt())
-        .to_string()
+    to_local_date_time(date).format(date_time_fmt()).to_string()
 }
 
 fn trash_label_ui(
     ui: &mut Ui,
     selected: &mut bool,
     restore: &mut bool,
-    trashed: &Trashed<Note>,
+    trashed: &Note,
 ) -> egui::Response {
-    let label = ui.add(note_label(*selected, &trashed.item));
+    let label = ui.add(note_label(*selected, todo!("note_name_in_dir"), trashed));
     label.context_menu(|ui| {
         if ui
             .button(format!(
@@ -540,9 +653,10 @@ fn explorer_note_label_ui(
     ui: &mut Ui,
     selected: &mut bool,
     remove: &mut bool,
+    note_name_in_dir: &str,
     note: &Note,
 ) -> egui::Response {
-    let label = ui.add(note_label(*selected, note));
+    let label = ui.add(note_label(*selected, note_name_in_dir, note));
     label.context_menu(|ui| {
         if ui
             .button(format!("{} {}", phosphor::TRASH, t!("trash_note")))
@@ -558,12 +672,59 @@ fn explorer_note_label_ui(
     label
 }
 
-fn note_label(selected: bool, note: &Note) -> Button {
-    let mut label_text = RichText::new(format!("{} {}", note.icon(), &note.content.name));
+fn note_label<'x>(selected: bool, note_name_in_dir: &str, note: &'x Note) -> Button<'x> {
+    let mut label_text = RichText::new(format!(
+        "{} {} - {}",
+        note.icon(),
+        &note_name_in_dir,
+        &note.title,
+    ));
 
     if selected {
         label_text = label_text.strong();
     }
 
     Button::selectable(selected, label_text)
+}
+
+fn scratch_pad_label<'x>(selected: bool, note_name_in_dir: &str, note: &'x Note) -> Button<'x> {
+    let mut label_text = RichText::new(format!("{} {}", note.icon(), &note_name_in_dir,));
+
+    if selected {
+        label_text = label_text.strong();
+    }
+
+    Button::selectable(selected, label_text)
+}
+
+fn create_action_buttons_ui(ui: &mut Ui, folder_id: u64) -> Option<FolderAction> {
+    let mut action = None;
+    if ui
+        .button(format!("{} {}", phosphor::PLUS, t!("new_note")))
+        .clicked()
+    {
+        action = FolderAction::CreateNote(folder_id).into();
+    }
+    if ui
+        .button(format!("{} {}", phosphor::PLUS, t!("new_folder")))
+        .clicked()
+    {
+        action = FolderAction::CreateSubFolder(folder_id).into()
+    }
+    action
+}
+
+fn folder_action_buttons_ui(ui: &mut Ui, folder_id: u64) -> Option<ExplorerAction> {
+    let mut action = None;
+    let create_action = create_action_buttons_ui(ui, folder_id);
+    if let Some(create_action) = create_action {
+        action = ExplorerAction::FolderTarget(create_action).into();
+    }
+    if ui
+        .button(format!("{} {}", phosphor::TRASH, t!("trash_note")))
+        .clicked()
+    {
+        action = ExplorerAction::FolderTarget(FolderAction::Delete(folder_id)).into();
+    }
+    action
 }

@@ -1,16 +1,59 @@
-use crate::note::{DEFAULT_NAME, Note, NoteContent};
-use crate::note_tree::NoteFolderTree;
-use crate::trash::{TrashBin, Trashed};
+use crate::note::{DEFAULT_FOLDER_NAME, DEFAULT_NAME, DEFAULT_ROOT_NAME, DEFAULT_TRASH_NAME, Note};
+use crate::storage::{DataNode, DataType, Directory, ObjectId, Storage, as_dir, as_dir_mut};
+use crate::util::generate_unique_name;
 
-pub enum NoteLookup<'note> {
-    Default(&'note Note),
-    ScratchPad(&'note Note),
-    Trashed(&'note Trashed<Note>),
+pub struct NoteLookup<'note> {
+    pub node: &'note DataNode<DataType<Note>>,
+    pub note: &'note Note,
+    pub display_type: DisplayType,
+}
+
+impl<'x> NoteLookup<'x> {
+    fn scratch_pad(node: &'x DataNode<DataType<Note>>) -> Self {
+        let note = as_note(&node.data).expect("Must be note");
+        Self {
+            node,
+            note,
+            display_type: DisplayType::ScratchPad,
+        }
+    }
+
+    fn default_node(node: &'x DataNode<DataType<Note>>) -> Self {
+        let note = as_note(&node.data).expect("Must be note");
+        Self {
+            node,
+            note,
+            display_type: DisplayType::Default,
+        }
+    }
+
+    fn deleted(node: &'x DataNode<DataType<Note>>) -> Self {
+        let note = as_note(&node.data).expect("Must be note");
+        Self {
+            node,
+            note,
+            display_type: DisplayType::Deleted,
+        }
+    }
+
+    fn default_or_deleted(node: &'x DataNode<DataType<Note>>) -> Self {
+        if node.is_deleted() {
+            Self::deleted(node)
+        } else {
+            Self::default_node(node)
+        }
+    }
+}
+
+pub enum DisplayType {
+    ScratchPad,
+    Deleted,
+    Default,
 }
 
 pub enum ContentLookup<'note> {
-    Mut(&'note mut NoteContent),
-    Immut(&'note NoteContent),
+    Mut(&'note mut Note),
+    Immut(&'note Note),
 }
 
 impl<'note> ContentLookup<'note> {
@@ -22,7 +65,7 @@ impl<'note> ContentLookup<'note> {
     }
 
     #[allow(dead_code)]
-    pub fn read(&self) -> &NoteContent {
+    pub fn read(&self) -> &Note {
         match self {
             ContentLookup::Mut(content) => content,
             ContentLookup::Immut(content) => content,
@@ -30,126 +73,196 @@ impl<'note> ContentLookup<'note> {
     }
 }
 
-impl<'note> NoteLookup<'note> {
-    #[allow(dead_code)]
-    pub fn is_trashed(&self) -> bool {
-        match self {
-            NoteLookup::Trashed(_) => true,
-            _ => false,
-        }
-    }
-
-    pub fn into_note(self) -> &'note Note {
-        match self {
-            NoteLookup::Default(note) => note,
-            NoteLookup::ScratchPad(note) => note,
-            NoteLookup::Trashed(trashed) => &trashed.item,
-        }
-    }
-}
-
 pub struct AppState {
     pub current_note_id: u64,
-    pub scratch_pad: Note,
-    pub notes: NoteFolderTree,
-    pub trash: TrashBin<u64, Note>,
+    pub scratch_pad_id: ObjectId,
+    pub storage: Storage<Note>,
+    pub trash_dir_id: ObjectId,
 }
 
 impl AppState {
-    pub fn current_note(&self) -> &Note {
-        self.lookup_current_note().into_note()
+    pub fn initial() -> Self {
+        let scratch_pad = Note::scratch_pad();
+        let root = Directory::with_name(DEFAULT_ROOT_NAME.to_owned());
+        let trash_dir = Directory::with_name(DEFAULT_TRASH_NAME.to_owned());
+        let mut tree = Storage::with_root(root);
+        let trash_dir_id = tree.add_dir(tree.root_dir_id(), trash_dir);
+        let scratch_pad_id = tree.add_object(scratch_pad);
+        Self {
+            current_note_id: scratch_pad_id,
+            scratch_pad_id,
+            storage: tree,
+            trash_dir_id,
+        }
+    }
+
+    pub fn scratch_pad_mut(&mut self) -> &mut Note {
+        as_note_mut(
+            &mut self
+                .storage
+                .get_object_mut(self.scratch_pad_id)
+                .expect("Scratch pad must be in storage")
+                .data,
+        )
+        .expect("Scratch Pad must be note")
+    }
+
+    pub fn scratch_pad(&self) -> &Note {
+        as_note(
+            &self
+                .storage
+                .get_object(self.scratch_pad_id)
+                .expect("Scratch Pad must be in storage")
+                .data,
+        )
+        .expect("Scratch Pad must be note")
     }
 
     pub fn lookup_current_note(&self) -> NoteLookup {
-        if self.scratch_pad.id == self.current_note_id {
-            NoteLookup::ScratchPad(&self.scratch_pad)
+        if self.scratch_pad_id == self.current_note_id {
+            NoteLookup::scratch_pad(
+                self
+                    .storage
+                    .get_object(self.current_note_id)
+                    .expect("Scratch Pad must be in storage"),
+            )
         } else {
-            lookup_note(self.current_note_id, &self.notes, &self.trash)
-                .expect("Current note must be present (during lookup note)")
+            NoteLookup::default_or_deleted(
+                self
+                    .storage
+                    .get_object(self.current_note_id)
+                    .expect("File must be in storage"),
+            )
         }
     }
 
     pub fn lookup_current_note_content(&mut self) -> ContentLookup {
-        if self.scratch_pad.id == self.current_note_id {
-            ContentLookup::Mut(&mut self.scratch_pad.content)
+        if self.scratch_pad_id == self.current_note_id {
+            ContentLookup::Mut(self.scratch_pad_mut())
         } else {
-            lookup_note_content(self.current_note_id, &mut self.notes, &self.trash)
-                .expect("Current note must be present (during lookup note content)")
+            let node = self
+                .storage
+                .get_object_mut(self.current_note_id)
+                .expect("File must be in storage");
+            let is_deleted = node.is_deleted();
+            let note = as_note_mut(&mut node.data).expect("Must be note");
+            if is_deleted {
+                ContentLookup::Immut(note)
+            } else {
+                ContentLookup::Mut(note)
+            }
         }
     }
 
-    pub fn new_note_then_switch(&mut self) {
-        let id = self
-            .notes
-            .root_folder_mut()
-            .insert_new_with_auto_name(DEFAULT_NAME.to_owned());
+    pub fn new_note_then_switch(&mut self, parent_folder_id: ObjectId) {
+        let id = self.add_note_with_auto_name(parent_folder_id, DEFAULT_NAME.to_owned());
         self.current_note_id = id;
     }
 
-    pub fn new_folder(&mut self, folder_name: String) {
-        let current_note_folder_id = self
-            .notes
-            .find_note_folder(&self.current_note_id)
-            .map(|note_folder| note_folder.id)
-            .unwrap_or(self.notes.root_folder().id);
-        self.notes.add_folder(&current_note_folder_id, folder_name);
+    fn add_note_with_auto_name(&mut self, parent_folder_id: ObjectId, name: String) -> ObjectId {
+        let note = Note::default();
+        let id = self.storage.add_object(note);
+        let parent_folder = self
+            .storage
+            .get_object_mut(parent_folder_id)
+            .map(|obj| as_dir_mut(&mut obj.data).expect("Must be dir"))
+            .expect("Parent dir must be in storage");
+        parent_folder.add_entry_with_unique_name(id, name);
+        id
+    }
+
+    fn add_folder_with_auto_name(&mut self, parent_folder_id: ObjectId, name: String) -> ObjectId {
+        let siblings = self
+            .storage
+            .get_sub_directories(parent_folder_id)
+            .expect("Parent must present in tree");
+        let name = generate_unique_name(
+            siblings
+                .iter()
+                .map(|&node| as_dir(&node.data).expect("Must be dir").name.as_str()),
+            name,
+        );
+        let dir = Directory::with_name(name);
+        
+        self.storage.add_dir(parent_folder_id, dir)
+    }
+
+    pub fn new_note(&mut self, parent_folder_id: ObjectId) {
+        self.add_note_with_auto_name(parent_folder_id, DEFAULT_NAME.to_owned());
+    }
+
+    pub fn new_folder(&mut self, parent_folder_id: ObjectId) {
+        self.add_folder_with_auto_name(parent_folder_id, DEFAULT_FOLDER_NAME.to_owned());
     }
 
     pub fn touch_current_note(&mut self) {
-        if self.scratch_pad.id == self.current_note_id {
-            self.scratch_pad.touch()
-        } else {
-            self.notes
-                .root_folder_mut()
-                .touch_note(self.current_note_id)
-                .expect("Note to touch must be present")
-        }
+        self.storage
+            .get_object_mut(self.current_note_id)
+            .expect("Current note must be present")
+            .touch();
     }
 
-    pub fn restore_note(&mut self, id: u64) {
-        let restored_note: Note = self
-            .trash
-            .remove(&id)
-            .expect("Note to restore must be present in trash");
-        self.notes
-            .root_folder_mut()
-            .put(restored_note.id, restored_note);
+    pub fn delete_dir(&mut self, dir_id: ObjectId) {
+        let dir_name = self
+            .storage
+            .get_object_mut(dir_id)
+            .map(|node| {
+                as_dir_mut(&mut node.data)
+                    .expect("Must be dir")
+                    .name
+                    .to_owned()
+            })
+            .expect("Must be in storage");
+        self.delete_object(dir_id, dir_name);
     }
 
-    pub fn trash_note(&mut self, id: u64) {
-        let removed_note = self
-            .notes
-            .root_folder_mut()
-            .remove(id)
-            .expect("Note to trash must be present in storage");
-        self.trash.put(removed_note.id, removed_note);
+    pub fn delete_object(&mut self, id: ObjectId, object_name: String) {
+        self
+            .storage
+            .get_object_mut(id)
+            .map(|obj| obj.delete())
+            .expect("Object must be in storage to delete");
+        self.storage
+            .get_object_mut(self.trash_dir_id)
+            .map(|obj| as_dir_mut(&mut obj.data).expect("Trash must be dir"))
+            .expect("Trash dir must be created")
+            .entries
+            .insert(object_name, id);
     }
-}
 
-fn lookup_note<'x>(
-    id: u64,
-    notes: &'x NoteFolderTree,
-    trash: &'x TrashBin<u64, Note>,
-) -> Option<NoteLookup<'x>> {
-    notes
-        .root_folder()
-        .get(id)
-        .map(|note| NoteLookup::Default(note))
-        .or_else(|| trash.get(&id).map(|trashed| NoteLookup::Trashed(trashed)))
-}
+    pub fn restore_object(&mut self, id: ObjectId) {
+        self.storage
+            .get_object_mut(id)
+            .map(|obj| obj.restore())
+            .unwrap()
+    }
 
-fn lookup_note_content<'x>(
-    id: u64,
-    notes: &'x mut NoteFolderTree,
-    trash: &'x TrashBin<u64, Note>,
-) -> Option<ContentLookup<'x>> {
-    notes
-        .root_folder_mut()
-        .get_mut_note_content(id)
-        .map(|content| ContentLookup::Mut(content))
-        .or_else(|| {
-            trash
-                .get(&id)
-                .map(|Trashed { item, .. }| ContentLookup::Immut(&item.content))
+    pub fn get_item_path_str(&self, id: ObjectId) -> Option<String> {
+        self.storage.get_object_path(id).map(|path| {
+            path.iter()
+                .map(|node| {
+                    self.storage
+                        .get_object(node.dir_id())
+                        .map(|obj| as_dir(&obj.data).expect("Must be dir in path"))
+                        .unwrap()
+                        .name
+                        .to_owned()
+                })
+                .collect::<Vec<String>>()
+                .join("/")
         })
+    }
+}
+
+pub fn as_note(data: &DataType<Note>) -> Option<&Note> {
+    match data {
+        DataType::File(file) => Some(file),
+        _ => None,
+    }
+}
+pub fn as_note_mut(data: &mut DataType<Note>) -> Option<&mut Note> {
+    match data {
+        DataType::File(file) => Some(file),
+        _ => None,
+    }
 }

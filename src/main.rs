@@ -3,10 +3,8 @@ mod egui_app;
 mod font_icons;
 mod id_gen;
 mod note;
-mod note_folder;
-mod note_tree;
 mod storage;
-mod trash;
+mod tree_like;
 mod util;
 
 use eframe::Renderer;
@@ -30,7 +28,7 @@ fn main() -> eframe::Result {
         options,
         Box::new(|cc| {
             // This gives us image support:
-            // egui_extras::install_image_loaders(&cc.egui_ctx);
+            egui_extras::install_image_loaders(&cc.egui_ctx);
 
             // Set scale:
             cc.egui_ctx.set_pixels_per_point(1.25);
