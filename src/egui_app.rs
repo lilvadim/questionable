@@ -16,6 +16,7 @@ use egui::Color32;
 use egui::Popup;
 use rust_i18n::t;
 
+use std::collections::VecDeque;
 use std::sync::{Arc, LazyLock};
 
 use chrono::DateTime;
@@ -34,8 +35,9 @@ fn gen_sample_text(lines_count: i32) -> String {
 }
 
 pub struct NotesApp {
-    pub state: AppState,
-    pub ui_state: UiState,
+    state: AppState,
+    command_queue: VecDeque<UiCommand>,
+    ui_state: UiState,
 }
 
 pub struct UiState {
@@ -66,7 +68,7 @@ impl Default for UiState {
 }
 
 #[derive(Debug)]
-enum ExplorerAction {
+enum UiCommand {
     FolderTarget(FolderAction),
     NoteTarget(NoteAction),
 }
@@ -92,6 +94,7 @@ impl NotesApp {
         state.scratch_pad_mut().text = gen_sample_text(100);
         Self {
             state,
+            command_queue: Default::default(),
             ui_state: Default::default(),
         }
     }
@@ -242,6 +245,10 @@ impl eframe::App for NotesApp {
                         .show_inside(ui, |ui| self.note_content_ui(ui))
                 }
             });
+
+        while let Some(command) = self.command_queue.pop_front() {
+            self.handle_explorer_action(command);
+        }
     }
 }
 
@@ -303,7 +310,6 @@ impl NotesApp {
 
     fn explorer_ui(&mut self, ui: &mut Ui) {
         ui.with_layout(Layout::top_down(Align::LEFT), |ui| {
-            let mut explorer_action = None;
             ScrollArea::vertical()
                 .stick_to_bottom(false)
                 .show(ui, |ui| {
@@ -315,8 +321,8 @@ impl NotesApp {
                             .add(scratch_pad_label(selected, SCRATCH_PAD_NAME, note))
                             .clicked()
                         {
-                            explorer_action =
-                                ExplorerAction::NoteTarget(NoteAction::Select(note_id)).into();
+                            self.command_queue
+                                .push_back(UiCommand::NoteTarget(NoteAction::Select(note_id)));
                         }
                     }
 
@@ -331,41 +337,40 @@ impl NotesApp {
                         _ => action,
                     });
                     if let Some(action) = folder_action {
-                        explorer_action = Some(ExplorerAction::FolderTarget(action));
+                        self.command_queue
+                            .push_back(UiCommand::FolderTarget(action));
                     }
 
+                    let mut commands = VecDeque::new();
                     self.explorer_folder_content_ui(
                         ui,
                         self.state.storage.root_dir_id(),
                         self.state.storage.root_dir(),
-                        &mut explorer_action,
+                        &mut commands,
                     );
+                    self.command_queue.extend(commands);
                 });
-
-            if let Some(action) = explorer_action {
-                self.handle_explorer_action(action)
-            }
         });
     }
 
-    fn handle_explorer_action(&mut self, action: ExplorerAction) {
+    fn handle_explorer_action(&mut self, action: UiCommand) {
         match action {
-            ExplorerAction::NoteTarget(NoteAction::Select(note_id)) => {
+            UiCommand::NoteTarget(NoteAction::Select(note_id)) => {
                 self.state.current_note_id = note_id
             }
-            ExplorerAction::NoteTarget(NoteAction::Delete(item_name, item_id)) => {
+            UiCommand::NoteTarget(NoteAction::Delete(item_name, item_id)) => {
                 self.state.delete_object(item_id, item_name)
             }
-            ExplorerAction::FolderTarget(FolderAction::CreateSubFolder(parent_folder_id)) => {
+            UiCommand::FolderTarget(FolderAction::CreateSubFolder(parent_folder_id)) => {
                 self.state.new_folder(parent_folder_id)
             }
-            ExplorerAction::FolderTarget(FolderAction::CreateNote(parent_folder_id)) => {
+            UiCommand::FolderTarget(FolderAction::CreateNote(parent_folder_id)) => {
                 self.state.new_note(parent_folder_id)
             }
-            ExplorerAction::FolderTarget(FolderAction::CreateNoteThenSelect(folder_id)) => {
+            UiCommand::FolderTarget(FolderAction::CreateNoteThenSelect(folder_id)) => {
                 self.state.new_note_then_switch(folder_id)
             }
-            ExplorerAction::FolderTarget(FolderAction::Delete(folder_id)) => {
+            UiCommand::FolderTarget(FolderAction::Delete(folder_id)) => {
                 self.state.delete_dir(folder_id);
             }
         }
@@ -376,22 +381,23 @@ impl NotesApp {
         ui: &mut Ui,
         folder_id: ObjectId,
         folder: &Directory,
-        action: &mut Option<ExplorerAction>,
+        command_queue: &mut VecDeque<UiCommand>,
     ) {
         ui.horizontal(|ui| {
             let collapsing =
                 CollapsingHeader::new(&folder.name)
                     .id_salt(folder_id)
                     .show(ui, |ui| {
-                        self.explorer_folder_content_ui(ui, folder_id, folder, action);
+                        self.explorer_folder_content_ui(ui, folder_id, folder, command_queue);
                     });
             [Some(collapsing.header_response), collapsing.body_response]
                 .iter()
                 .flatten()
                 .for_each(|response| {
                     Popup::context_menu(response).show(|ui| {
-                        let folder_action = folder_action_buttons_ui(ui, folder_id);
-                        *action = folder_action;
+                        if let Some(folder_action) = folder_action_buttons_ui(ui, folder_id) {
+                            command_queue.push_back(folder_action);
+                        }
                     });
                 });
         });
@@ -402,7 +408,7 @@ impl NotesApp {
         ui: &mut Ui,
         folder_id: ObjectId,
         folder: &Directory,
-        action: &mut Option<ExplorerAction>,
+        command_queue: &mut VecDeque<UiCommand>,
     ) {
         let show_deleted = folder_id == self.state.trash_dir_id;
         let mut notes = folder
@@ -428,14 +434,13 @@ impl NotesApp {
                 let mut remove = false;
                 explorer_note_label_ui(ui, &mut selected, &mut remove, note_name, node);
                 if selected && !was_selected {
-                    *action = ExplorerAction::NoteTarget(NoteAction::Select(note_id)).into();
+                    command_queue.push_back(UiCommand::NoteTarget(NoteAction::Select(note_id)));
                 }
                 if remove {
-                    *action = ExplorerAction::NoteTarget(NoteAction::Delete(
+                    command_queue.push_back(UiCommand::NoteTarget(NoteAction::Delete(
                         note_name.to_owned(),
                         note_id,
-                    ))
-                    .into();
+                    )));
                 }
             });
         let mut sub_folders = self.state.storage.get_sub_directories(folder_id).unwrap();
@@ -446,7 +451,7 @@ impl NotesApp {
                 ui,
                 sub_folder.id(),
                 as_dir(&sub_folder.data).expect("Must be dir"),
-                action,
+                command_queue,
             );
         });
     }
@@ -542,7 +547,7 @@ impl NotesApp {
             ui.add_space(ui.spacing().item_spacing.y);
             if let NoteLookup {
                 node,
-                note,
+                note: _,
                 display_type: DisplayType::Deleted,
             } = self.state.lookup_current_note()
             {
@@ -714,17 +719,17 @@ fn create_action_buttons_ui(ui: &mut Ui, folder_id: u64) -> Option<FolderAction>
     action
 }
 
-fn folder_action_buttons_ui(ui: &mut Ui, folder_id: u64) -> Option<ExplorerAction> {
+fn folder_action_buttons_ui(ui: &mut Ui, folder_id: u64) -> Option<UiCommand> {
     let mut action = None;
     let create_action = create_action_buttons_ui(ui, folder_id);
     if let Some(create_action) = create_action {
-        action = ExplorerAction::FolderTarget(create_action).into();
+        action = UiCommand::FolderTarget(create_action).into();
     }
     if ui
         .button(format!("{} {}", phosphor::TRASH, t!("trash_note")))
         .clicked()
     {
-        action = ExplorerAction::FolderTarget(FolderAction::Delete(folder_id)).into();
+        action = UiCommand::FolderTarget(FolderAction::Delete(folder_id)).into();
     }
     action
 }
