@@ -1,10 +1,10 @@
 mod app;
+mod data;
 mod egui_app;
 mod font_icons;
 mod id_gen;
 mod note;
-mod storage;
-mod tree_like;
+mod thread_pool;
 mod util;
 
 use eframe::Renderer;
@@ -30,11 +30,8 @@ fn main() -> eframe::Result {
             // This gives us image support:
             egui_extras::install_image_loaders(&cc.egui_ctx);
 
-            // Set scale:
-            cc.egui_ctx.set_pixels_per_point(1.25);
-
             NotesApp::setup_fonts(&cc.egui_ctx);
-            Ok(Box::new(NotesApp::demo()))
+            Ok(Box::new(NotesApp::init()))
         }),
     )
 }

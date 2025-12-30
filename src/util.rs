@@ -3,11 +3,25 @@ use std::collections::HashMap;
 use regex::Regex;
 
 pub mod chrono {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use chrono::{DateTime, Local, TimeZone, Utc};
 
     #[inline]
     pub fn to_local_date_time(utc_date_time: &DateTime<Utc>) -> DateTime<Local> {
         Local.from_utc_datetime(&utc_date_time.naive_utc())
+    }
+
+    pub fn to_date_time_utc(sys_time: SystemTime) -> DateTime<Utc> {
+        DateTime::from_timestamp_secs(
+            sys_time
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                .try_into()
+                .unwrap(),
+        )
+        .expect("DateTime<Utc>")
     }
 }
 

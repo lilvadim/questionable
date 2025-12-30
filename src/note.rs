@@ -13,7 +13,6 @@ pub const SCRATCH_PAD_NAME: &str = "Scratch Pad";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Note {
-    pub title: String,
     pub text: String,
     pub metadata: Metadata,
 }
@@ -21,7 +20,6 @@ pub struct Note {
 impl Default for Note {
     fn default() -> Self {
         Self {
-            title: String::from(DEFAULT_TITLE),
             text: String::new(),
             metadata: Default::default(),
         }
@@ -30,13 +28,15 @@ impl Default for Note {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Metadata {
-    icon: String,
+    pub icon: String,
+    pub is_scratch_pad: bool,
 }
 
 impl Default for Metadata {
     fn default() -> Self {
         Self {
             icon: DEFAULT_ICON.to_owned(),
+            is_scratch_pad: false,
         }
     }
 }
@@ -44,15 +44,32 @@ impl Default for Metadata {
 impl Note {
     pub fn scratch_pad() -> Self {
         Self {
-            title: String::from(SCRATCH_PAD_NAME),
             metadata: Metadata {
                 icon: SCRATCH_PAD_ICON.to_owned(),
+                is_scratch_pad: true,
                 ..Default::default()
             },
             ..Default::default()
         }
     }
+
+    pub fn from_text(text: String) -> Self {
+        Self {
+            text,
+            ..Default::default()
+        }
+    }
     pub fn icon(&self) -> &str {
         &self.metadata.icon
+    }
+
+    pub fn title(&self) -> Option<&str> {
+        self.text
+            .split_once(char::is_whitespace)
+            .map(|(head, _tail)| head)
+    }
+
+    pub fn is_scratch_pad(&self) -> bool {
+        self.metadata.is_scratch_pad
     }
 }

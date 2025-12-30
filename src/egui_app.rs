@@ -1,22 +1,21 @@
-use crate::app::AppState;
-use crate::app::ContentLookup;
-use crate::app::DisplayType;
-use crate::app::NoteLookup;
-use crate::app::as_note;
+use crate::app::NonBlockingApplication;
+use crate::app::NotesLocationConfig;
+use crate::data::DataNode;
+use crate::data::DirEntry;
+use crate::data::Directory;
 use crate::font_icons::phosphor;
+use crate::note::DEFAULT_ICON;
 use crate::note::Note;
+use crate::note::SCRATCH_PAD_ICON;
 use crate::note::SCRATCH_PAD_NAME;
-use crate::storage::Directory;
-use crate::storage::ObjectId;
-use crate::storage::as_dir;
 use crate::util::chrono::to_local_date_time;
-use crate::util::egui::item_spacing;
 use egui::CollapsingHeader;
-use egui::Color32;
 use egui::Popup;
 use rust_i18n::t;
 
 use std::collections::VecDeque;
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::{Arc, LazyLock};
 
 use chrono::DateTime;
@@ -28,22 +27,26 @@ use egui::{
     TopBottomPanel, Widget, Window,
 };
 
-fn gen_sample_text(lines_count: i32) -> String {
-    (0..lines_count)
-        .map(|number| format!("Sample text line. The line number is {number}\n"))
-        .collect()
+#[derive(Debug)]
+pub enum Command {
+    SelectAndReadNote(PathBuf),
+    ReadDir(PathBuf),
+    CreateNote(PathBuf),
+    DeleteNote(PathBuf),
+    DeleteDir(PathBuf),
+    CreateNoteThenSelect(PathBuf),
+    CreateSubDir(PathBuf),
 }
 
 pub struct NotesApp {
-    state: AppState,
-    command_queue: VecDeque<UiCommand>,
+    app: NonBlockingApplication,
+    command_queue: VecDeque<Command>,
     ui_state: UiState,
 }
 
 pub struct UiState {
     pub explorer_layout: ExplorerLayout,
     pub explorer: bool,
-    pub content_is_scrolled: bool,
     pub egui_settings: bool,
     pub trash: bool,
 }
@@ -59,7 +62,6 @@ impl Default for UiState {
     fn default() -> Self {
         Self {
             explorer: true,
-            content_is_scrolled: Default::default(),
             egui_settings: Default::default(),
             explorer_layout: Default::default(),
             trash: Default::default(),
@@ -67,33 +69,13 @@ impl Default for UiState {
     }
 }
 
-#[derive(Debug)]
-enum UiCommand {
-    FolderTarget(FolderAction),
-    NoteTarget(NoteAction),
-}
-
-#[derive(Debug)]
-enum FolderAction {
-    CreateSubFolder(ObjectId),
-    CreateNote(ObjectId),
-    CreateNoteThenSelect(ObjectId),
-    Delete(ObjectId),
-}
-
-#[derive(Debug)]
-enum NoteAction {
-    Select(ObjectId),
-    Delete(String, ObjectId),
-}
-
 /// Create demo instance
 impl NotesApp {
-    pub fn demo() -> Self {
-        let mut state = AppState::initial();
-        state.scratch_pad_mut().text = gen_sample_text(100);
+    pub fn init() -> Self {
+        let app = NonBlockingApplication::init(NotesLocationConfig::default()).unwrap();
+        // state.scratch_pad_mut().text = gen_sample_text(100);
         Self {
-            state,
+            app,
             command_queue: Default::default(),
             ui_state: Default::default(),
         }
@@ -102,6 +84,7 @@ impl NotesApp {
 
 impl eframe::App for NotesApp {
     fn update(&mut self, ctx: &eframe::egui::Context, _frame: &mut eframe::Frame) {
+        self.app.poll_background_tasks();
         // if ctx.input(|i| i.viewport().fullscreen.is_none_or(|fullscreen| !fullscreen)) {
         //     TopBottomPanel::top("native_title_bar_padding_panel")
         //         .frame(Frame::side_top_panel(&ctx.style()).inner_margin(0.))
@@ -190,7 +173,7 @@ impl eframe::App for NotesApp {
                                     .selectable(false),
                                 );
                             });
-                            self.explorer_ui(ui)
+                            Self::explorer_ui(&mut self.app, &mut self.command_queue, ui)
                         });
                 }
                 ExplorerLayout::SideBar => {
@@ -203,7 +186,7 @@ impl eframe::App for NotesApp {
                         {
                             self.ui_state.explorer_layout = ExplorerLayout::Windowed
                         }
-                        self.explorer_ui(ui);
+                        Self::explorer_ui(&mut self.app, &mut self.command_queue, ui);
                     });
                 }
             }
@@ -215,24 +198,14 @@ impl eframe::App for NotesApp {
             .show(ctx, |ui| {
                 // Draw Status Bar
                 {
-                    let status_bar_visible = self.ui_state.content_is_scrolled;
-                    let opacity_anim =
-                        ctx.animate_bool("status_bar_opacity".into(), status_bar_visible);
-
-                    let default_item_spacing =
-                        std::mem::replace(&mut ui.spacing_mut().item_spacing.y, 0.);
-                    ui.scope(|ui| {
-                        ui.set_opacity(opacity_anim);
-                        egui::TopBottomPanel::top("status_bar_panel")
-                            .frame(Frame::side_top_panel(&ctx.style()).inner_margin(
-                                Margin::symmetric(
-                                    ctx.style().spacing.item_spacing.x as i8,
-                                    ctx.style().spacing.item_spacing.y as i8 * 2,
-                                ),
-                            ))
-                            .show_inside(ui, |ui| self.status_bar_ui(ui));
-                    });
-                    ui.spacing_mut().item_spacing.y = default_item_spacing;
+                    egui::TopBottomPanel::top("status_bar_panel")
+                        .frame(
+                            Frame::side_top_panel(&ctx.style()).inner_margin(Margin::symmetric(
+                                ctx.style().spacing.item_spacing.x as i8,
+                                ctx.style().spacing.item_spacing.y as i8 * 2,
+                            )),
+                        )
+                        .show_inside(ui, |ui| Self::status_bar_ui(&self.app, ui));
                 }
 
                 // Draw Title and Editor
@@ -247,7 +220,7 @@ impl eframe::App for NotesApp {
             });
 
         while let Some(command) = self.command_queue.pop_front() {
-            self.handle_explorer_action(command);
+            handle_command(&mut self.app, command);
         }
     }
 }
@@ -308,289 +281,121 @@ impl NotesApp {
         ctx.set_fonts(fonts);
     }
 
-    fn explorer_ui(&mut self, ui: &mut Ui) {
+    fn explorer_ui(
+        app: &NonBlockingApplication,
+        command_queue: &mut VecDeque<Command>,
+        ui: &mut Ui,
+    ) {
         ui.with_layout(Layout::top_down(Align::LEFT), |ui| {
             ScrollArea::vertical()
                 .stick_to_bottom(false)
                 .show(ui, |ui| {
                     {
-                        let (note_id, note) =
-                            (self.state.scratch_pad_id, &self.state.scratch_pad());
-                        let selected = self.state.current_note_id == note_id;
-                        if ui
-                            .add(scratch_pad_label(selected, SCRATCH_PAD_NAME, note))
-                            .clicked()
-                        {
-                            self.command_queue
-                                .push_back(UiCommand::NoteTarget(NoteAction::Select(note_id)));
+                        let selected = app.is_selected(&app.scratch_pad_path());
+                        if ui.add(scratch_pad_label(selected)).clicked() {
+                            command_queue.push_back(Command::SelectAndReadNote(
+                                app.scratch_pad_path().to_path_buf(),
+                            ));
                         }
                     }
 
                     ui.separator();
-                    let folder_action =
-                        create_action_buttons_ui(ui, self.state.storage.root_dir_id());
+                    let dir_action = create_action_buttons_ui(ui, app.base_dir_path());
                     // in root switch to created note
-                    let folder_action = folder_action.map(|action| match action {
-                        FolderAction::CreateNote(folder) => {
-                            FolderAction::CreateNoteThenSelect(folder)
-                        }
+                    let dir_action = dir_action.map(|action| match action {
+                        Command::CreateNote(dir) => Command::CreateNoteThenSelect(dir),
                         _ => action,
                     });
-                    if let Some(action) = folder_action {
-                        self.command_queue
-                            .push_back(UiCommand::FolderTarget(action));
+                    if let Some(action) = dir_action {
+                        command_queue.push_back(action);
                     }
 
-                    let mut commands = VecDeque::new();
-                    self.explorer_folder_content_ui(
-                        ui,
-                        self.state.storage.root_dir_id(),
-                        self.state.storage.root_dir(),
-                        &mut commands,
-                    );
-                    self.command_queue.extend(commands);
+                    let mut add_actions = VecDeque::new();
+                    if let Some(root) = app.base_dir() {
+                        explorer_folder_content_ui(&app, ui, root, &mut add_actions, false);
+                        command_queue.extend(add_actions);
+                    } else {
+                        command_queue
+                            .push_back(Command::ReadDir(app.base_dir_path().to_path_buf()));
+                    }
                 });
         });
     }
 
-    fn handle_explorer_action(&mut self, action: UiCommand) {
-        match action {
-            UiCommand::NoteTarget(NoteAction::Select(note_id)) => {
-                self.state.current_note_id = note_id
-            }
-            UiCommand::NoteTarget(NoteAction::Delete(item_name, item_id)) => {
-                self.state.delete_object(item_id, item_name)
-            }
-            UiCommand::FolderTarget(FolderAction::CreateSubFolder(parent_folder_id)) => {
-                self.state.new_folder(parent_folder_id)
-            }
-            UiCommand::FolderTarget(FolderAction::CreateNote(parent_folder_id)) => {
-                self.state.new_note(parent_folder_id)
-            }
-            UiCommand::FolderTarget(FolderAction::CreateNoteThenSelect(folder_id)) => {
-                self.state.new_note_then_switch(folder_id)
-            }
-            UiCommand::FolderTarget(FolderAction::Delete(folder_id)) => {
-                self.state.delete_dir(folder_id);
-            }
-        }
-    }
-
-    fn explorer_folder_ui(
-        &self,
-        ui: &mut Ui,
-        folder_id: ObjectId,
-        folder: &Directory,
-        command_queue: &mut VecDeque<UiCommand>,
-    ) {
-        ui.horizontal(|ui| {
-            let collapsing =
-                CollapsingHeader::new(&folder.name)
-                    .id_salt(folder_id)
-                    .show(ui, |ui| {
-                        self.explorer_folder_content_ui(ui, folder_id, folder, command_queue);
-                    });
-            [Some(collapsing.header_response), collapsing.body_response]
-                .iter()
-                .flatten()
-                .for_each(|response| {
-                    Popup::context_menu(response).show(|ui| {
-                        if let Some(folder_action) = folder_action_buttons_ui(ui, folder_id) {
-                            command_queue.push_back(folder_action);
-                        }
-                    });
-                });
-        });
-    }
-
-    fn explorer_folder_content_ui(
-        &self,
-        ui: &mut Ui,
-        folder_id: ObjectId,
-        folder: &Directory,
-        command_queue: &mut VecDeque<UiCommand>,
-    ) {
-        let show_deleted = folder_id == self.state.trash_dir_id;
-        let mut notes = folder
-            .entries
-            .iter()
-            .map(|(name, &id)| (name.as_str(), id))
-            .collect::<Vec<(&str, ObjectId)>>();
-        notes.sort();
-        notes
-            .into_iter()
-            .map(|(note_name, note_id)| {
-                (
-                    note_id,
-                    note_name,
-                    self.state.storage.get_object(note_id).unwrap(),
-                )
-            })
-            .filter(|(_, _, node)| node.is_deleted() == show_deleted)
-            .map(|(id, name, node)| (id, name, as_note(&node.data).expect("Must be note")))
-            .for_each(|(note_id, note_name, node)| {
-                let was_selected = self.state.current_note_id == note_id;
-                let mut selected = was_selected;
-                let mut remove = false;
-                explorer_note_label_ui(ui, &mut selected, &mut remove, note_name, node);
-                if selected && !was_selected {
-                    command_queue.push_back(UiCommand::NoteTarget(NoteAction::Select(note_id)));
-                }
-                if remove {
-                    command_queue.push_back(UiCommand::NoteTarget(NoteAction::Delete(
-                        note_name.to_owned(),
-                        note_id,
-                    )));
-                }
-            });
-        let mut sub_folders = self.state.storage.get_sub_directories(folder_id).unwrap();
-        sub_folders
-            .sort_by_key(|folder| as_dir(&folder.data).expect("Must be dir").name.to_owned());
-        sub_folders.into_iter().for_each(|sub_folder| {
-            self.explorer_folder_ui(
-                ui,
-                sub_folder.id(),
-                as_dir(&sub_folder.data).expect("Must be dir"),
-                command_queue,
-            );
-        });
-    }
-
-    fn status_bar_ui(&self, ui: &mut Ui) {
+    fn status_bar_ui(app: &NonBlockingApplication, ui: &mut Ui) {
         let layout = Layout::left_to_right(Align::TOP).with_main_align(Align::LEFT);
-        let current_note_id = self.state.current_note_id;
         ui.with_layout(layout, |ui| {
-            let current = self.state.lookup_current_note();
-            let note = &current.note;
-            match current.display_type {
-                DisplayType::Default => {
-                    let path = self
-                        .state
-                        .get_item_path_str(current_note_id)
-                        .expect("Path for note in tree must be present");
-                    let text = format!("{}/ {} {}", path, &note.icon(), &note.title);
-                    Label::new(RichText::new(text)).selectable(false).ui(ui);
-                }
-                DisplayType::ScratchPad => {
-                    let text = format!("{} {}", &note.icon(), &note.title);
-                    Label::new(RichText::new(text)).selectable(false).ui(ui);
-                }
-                DisplayType::Deleted => {
-                    let text = format!(
-                        "{} {} / {} {}",
-                        phosphor::TRASH,
-                        t!("trash"),
-                        &note.icon(),
-                        &note.title
-                    );
-                    Label::new(RichText::new(text).color(Color32::RED))
-                        .selectable(false)
-                        .ui(ui);
-                }
-            }
+            Label::new(RichText::new(app.current_note_path().to_string_lossy()))
+                .selectable(false)
+                .ui(ui);
         });
     }
 
-    fn title_ui(&mut self, ui: &mut Ui) {
-        let layout = Layout::top_down_justified(Align::LEFT);
-        ui.with_layout(layout, |ui| {
-            let current_note_id = self.state.current_note_id;
-            let node = self
-                .state
-                .storage
-                .get_object(current_note_id)
-                .expect("Must be in storage");
-            let note = as_note(&node.data).expect("Must be note");
-
-            self.state.get_item_path_str(current_note_id).map(|path| {
-                ui.weak(path);
-                ui.add_space(item_spacing(ui.ctx(), &layout));
-            });
-
-            let mod_date = format_date_time(&node.modification_time);
-            ui.weak(format!("{} {}", t!("modified"), mod_date));
-
-            ui.add_space(item_spacing(ui.ctx(), &layout));
-
-            let icon_label = Label::new(RichText::new(note.icon()).heading());
-            let title_text = match self.state.lookup_current_note_content() {
-                ContentLookup::Mut(content) => &mut content.title,
-                ContentLookup::Immut(content) => &mut content.title.clone(),
-            };
-            let title_text_edit = TextEdit::singleline(title_text)
-                .desired_rows(1)
-                .clip_text(false)
-                .font(TextStyle::Heading)
-                .frame(false)
-                .background_color(ui.visuals().panel_fill);
-
-            ui.add(icon_label);
-
-            let mut title_changed = false;
-            ScrollArea::horizontal()
-                .stick_to_right(false)
-                .show(ui, |ui| {
-                    if ui.add(title_text_edit).changed() {
-                        title_changed = true;
-                    }
-                });
-            if title_changed {
-                self.state.touch_current_note();
-            }
-
-            ui.add_space(item_spacing(ui.ctx(), &layout));
-        });
-    }
+    // fn title_ui(&mut self, ui: &mut Ui) {
+    //     let layout = Layout::top_down_justified(Align::LEFT);
+    //     ui.with_layout(layout, |ui| {
+    //         let current_note_id = self.state.current_note_id;
+    //         let node = self.state.lookup_current_note().node;
+    //         let note = &node.data;
+    //
+    //         self.state.get_item_path_str(current_note_id).map(|path| {
+    //             ui.weak(path);
+    //             ui.add_space(item_spacing(ui.ctx(), &layout));
+    //         });
+    //
+    //         let mod_date = format_date_time(&node.modification_time);
+    //         ui.weak(format!("{} {}", t!("modified"), mod_date));
+    //
+    //         ui.add_space(item_spacing(ui.ctx(), &layout));
+    //
+    //         let icon_label = Label::new(RichText::new(note.icon()).heading());
+    //         let title_text = match self.state.lookup_current_note_content() {
+    //             MaybeMutRef::Mut(content) => &mut content.title,
+    //             MaybeMutRef::Immut(content) => &mut content.title.clone(),
+    //         };
+    //         let title_text_edit = TextEdit::multiline(title_text)
+    //             .desired_rows(1)
+    //             .clip_text(false)
+    //             .font(TextStyle::Heading)
+    //             .frame(false)
+    //             .clip_text(true)
+    //             .return_key(None)
+    //             .background_color(ui.visuals().panel_fill);
+    //
+    //         ui.add(icon_label);
+    //
+    //         let title_edit_response = ui.add(title_text_edit);
+    //         if title_edit_response.changed() {
+    //             self.state.touch_current_note();
+    //         }
+    //
+    //         let switch_focus = title_edit_response
+    //             .ctx
+    //             .input(|i| i.key_pressed(Key::Enter) || i.key_pressed(Key::Tab));
+    //         if switch_focus {
+    //             title_edit_response.surrender_focus();
+    //         }
+    //         ui.add_space(item_spacing(ui.ctx(), &layout));
+    //     });
+    // }
 
     fn note_content_ui(&mut self, ui: &mut Ui) {
-        let scroll_area = ScrollArea::both().stick_to_bottom(false).show(ui, |ui| {
-            ui.add_space(ui.spacing().item_spacing.y);
-            if let NoteLookup {
-                node,
-                note: _,
-                display_type: DisplayType::Deleted,
-            } = self.state.lookup_current_note()
-            {
-                let trash_put_time = format_date_time(
-                    &node
-                        .deletion_time
-                        .expect("Deletion time must be present as node is deleted"),
-                );
-                ui.label(
-                    RichText::new(format!(
-                        "{} {} {}",
-                        phosphor::INFO,
-                        t!("note_added_to_trash"),
-                        trash_put_time
-                    ))
-                    .color(Color32::RED),
-                );
-                if ui
-                    .button(format!(
-                        "{} {}",
-                        phosphor::ARROW_CCW,
-                        t!("restore_from_trash")
-                    ))
-                    .clicked()
-                {
-                    self.state.restore_object(node.id());
-                }
-            }
+        let current_note_loaded = self.app.is_note_in_storage(&self.app.current_note_path());
+        if !current_note_loaded {
+            self.command_queue.push_back(Command::SelectAndReadNote(
+                self.app.current_note_path().to_path_buf(),
+            ));
+        } else if let Some(current_note) = self
+            .app
+            .get_note_mut(&self.app.current_note_path().to_path_buf())
+        {
+            let _scroll_area = ScrollArea::both().stick_to_bottom(false).show(ui, |ui| {
+                ui.add_space(ui.spacing().item_spacing.y);
 
-            let content = self.state.lookup_current_note_content();
-            let mutable = content.is_mut();
-            ui.add_enabled_ui(mutable, |ui| {
-                self.title_ui(ui);
-                ui.separator();
+                // self.title_ui(ui);
+                // ui.separator();
 
-                let content = self.state.lookup_current_note_content();
-                let note_text = match content {
-                    ContentLookup::Mut(content) => &mut content.text,
-                    ContentLookup::Immut(content) => &mut content.text.clone(),
-                };
-
-                if TextEdit::multiline(note_text)
-                    .interactive(mutable)
+                if TextEdit::multiline(&mut current_note.data.text)
                     .desired_width(f32::INFINITY)
                     .font(TextStyle::Body)
                     .background_color(ui.visuals().panel_fill)
@@ -601,12 +406,10 @@ impl NotesApp {
                     .ui(ui)
                     .changed()
                 {
-                    self.state.touch_current_note();
+                    // TODO: Save
                 }
-            })
-        });
-        let scrolled = scroll_area.state.offset.y > 0.0;
-        self.ui_state.content_is_scrolled = scrolled;
+            });
+        }
     }
 
     fn trash_ui_windowed(&mut self, ctx: &Context) {
@@ -634,56 +437,52 @@ fn trash_label_ui(
     restore: &mut bool,
     trashed: &Note,
 ) -> egui::Response {
-    let label = ui.add(note_label(*selected, todo!("note_name_in_dir"), trashed));
-    label.context_menu(|ui| {
-        if ui
-            .button(format!(
-                "{} {}",
-                phosphor::ARROW_CCW,
-                t!("restore_from_trash")
-            ))
-            .clicked()
-        {
-            *restore = true;
-            ui.close();
-        }
-    });
-    if label.clicked() {
-        *selected = true
-    }
-    label
+    // let label = ui.add(note_label(*selected, todo!("note_name_in_dir"), trashed));
+    // label.context_menu(|ui| {
+    //     if ui
+    //         .button(format!(
+    //             "{} {}",
+    //             phosphor::ARROW_CCW,
+    //             t!("restore_from_trash")
+    //         ))
+    //         .clicked()
+    //     {
+    //         *restore = true;
+    //         ui.close();
+    //     }
+    // });
+    // if label.clicked() {
+    //     *selected = true
+    // }
+    // label
+    todo!()
 }
 
 fn explorer_note_label_ui(
     ui: &mut Ui,
-    selected: &mut bool,
-    remove: &mut bool,
+    selected: bool,
     note_name_in_dir: &str,
-    note: &Note,
-) -> egui::Response {
-    let label = ui.add(note_label(*selected, note_name_in_dir, note));
+    note_path: &Path,
+) -> (egui::Response, VecDeque<Command>) {
+    let mut commands = VecDeque::new();
+    let label = ui.add(note_label(selected, note_name_in_dir));
     label.context_menu(|ui| {
         if ui
             .button(format!("{} {}", phosphor::TRASH, t!("trash_note")))
             .clicked()
         {
-            *remove = true;
+            commands.push_back(Command::DeleteNote(note_path.to_path_buf()));
             ui.close();
         }
     });
-    if label.clicked() {
-        *selected = true
+    if label.clicked() && !selected {
+        commands.push_back(Command::SelectAndReadNote(note_path.to_path_buf()));
     }
-    label
+    (label, commands)
 }
 
-fn note_label<'x>(selected: bool, note_name_in_dir: &str, note: &'x Note) -> Button<'x> {
-    let mut label_text = RichText::new(format!(
-        "{} {} - {}",
-        note.icon(),
-        &note_name_in_dir,
-        &note.title,
-    ));
+fn note_label<'x>(selected: bool, note_name_in_dir: &str) -> Button<'x> {
+    let mut label_text = RichText::new(format!("{} {}", DEFAULT_ICON, &note_name_in_dir,));
 
     if selected {
         label_text = label_text.strong();
@@ -692,8 +491,8 @@ fn note_label<'x>(selected: bool, note_name_in_dir: &str, note: &'x Note) -> But
     Button::selectable(selected, label_text)
 }
 
-fn scratch_pad_label<'x>(selected: bool, note_name_in_dir: &str, note: &'x Note) -> Button<'x> {
-    let mut label_text = RichText::new(format!("{} {}", note.icon(), &note_name_in_dir,));
+fn scratch_pad_label<'x>(selected: bool) -> Button<'x> {
+    let mut label_text = RichText::new(format!("{} {}", SCRATCH_PAD_ICON, SCRATCH_PAD_NAME));
 
     if selected {
         label_text = label_text.strong();
@@ -702,34 +501,129 @@ fn scratch_pad_label<'x>(selected: bool, note_name_in_dir: &str, note: &'x Note)
     Button::selectable(selected, label_text)
 }
 
-fn create_action_buttons_ui(ui: &mut Ui, folder_id: u64) -> Option<FolderAction> {
+fn create_action_buttons_ui(ui: &mut Ui, dir_path: &Path) -> Option<Command> {
     let mut action = None;
     if ui
         .button(format!("{} {}", phosphor::PLUS, t!("new_note")))
         .clicked()
     {
-        action = FolderAction::CreateNote(folder_id).into();
+        action = Command::CreateNoteThenSelect(dir_path.to_path_buf()).into();
     }
     if ui
         .button(format!("{} {}", phosphor::PLUS, t!("new_folder")))
         .clicked()
     {
-        action = FolderAction::CreateSubFolder(folder_id).into()
+        action = Command::CreateSubDir(dir_path.to_path_buf()).into()
     }
     action
 }
 
-fn folder_action_buttons_ui(ui: &mut Ui, folder_id: u64) -> Option<UiCommand> {
-    let mut action = None;
-    let create_action = create_action_buttons_ui(ui, folder_id);
-    if let Some(create_action) = create_action {
-        action = UiCommand::FolderTarget(create_action).into();
-    }
+fn dir_action_buttons_ui(ui: &mut Ui, dir_path: &Path) -> Option<Command> {
+    let mut action = create_action_buttons_ui(ui, dir_path);
     if ui
         .button(format!("{} {}", phosphor::TRASH, t!("trash_note")))
         .clicked()
     {
-        action = UiCommand::FolderTarget(FolderAction::Delete(folder_id)).into();
+        action = Some(Command::DeleteDir(dir_path.to_path_buf()));
     }
     action
+}
+
+fn explorer_folder_ui(
+    app: &NonBlockingApplication,
+    ui: &mut Ui,
+    dir_name: &str,
+    dir_path: &Path,
+    command_queue: &mut VecDeque<Command>,
+) {
+    ui.horizontal(|ui| {
+        let collapsing = CollapsingHeader::new(dir_name)
+            .id_salt(&dir_path)
+            .show(ui, |ui| {
+                if let Some(dir) = app.get_dir(dir_path) {
+                    explorer_folder_content_ui(app, ui, dir, command_queue, false);
+                }
+            });
+        if collapsing.header_response.clicked() {
+            command_queue.push_back(Command::ReadDir(dir_path.to_path_buf()));
+        }
+        [Some(collapsing.header_response), collapsing.body_response]
+            .iter()
+            .flatten()
+            .for_each(|response| {
+                Popup::context_menu(response).show(|ui| {
+                    if let Some(dir_action) = dir_action_buttons_ui(ui, &dir_path) {
+                        command_queue.push_back(dir_action);
+                    }
+                });
+            });
+    });
+}
+
+fn explorer_folder_content_ui(
+    app: &NonBlockingApplication,
+    ui: &mut Ui,
+    dir: &DataNode<Directory>,
+    command_queue: &mut VecDeque<Command>,
+    show_hidden: bool,
+) {
+    let mut notes = dir
+        .data
+        .entries
+        .iter()
+        .filter_map(|(name, ent)| {
+            if let DirEntry::File(path) = ent
+                && (show_hidden || !path.file_name().unwrap().to_string_lossy().starts_with("."))
+            {
+                Some((name.as_str(), path.as_path()))
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<(&str, &Path)>>();
+    notes.sort_by_key(|(name, _)| name.to_owned());
+    notes.into_iter().for_each(|(note_name, note_path)| {
+        let selected = app.is_selected(note_path);
+        let (_, commands) = explorer_note_label_ui(ui, selected, note_name, note_path);
+        command_queue.extend(commands);
+    });
+    let mut sub_folders = dir
+        .data
+        .entries
+        .iter()
+        .filter_map(|(name, ent)| {
+            if let DirEntry::Dir(path) = ent {
+                Some((name.as_str(), path.as_path()))
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<(&str, &Path)>>();
+    sub_folders.sort_by_key(|(name, _path)| name.to_owned());
+    sub_folders.iter().for_each(|(name, path)| {
+        explorer_folder_ui(app, ui, name, path, command_queue);
+    });
+}
+
+fn handle_command(app: &mut NonBlockingApplication, command: Command) {
+    match command {
+        Command::SelectAndReadNote(path_buf) => {
+            let is_loaded = app.is_note_in_storage(&path_buf);
+            if !is_loaded && !app.is_note_pending(&path_buf) {
+                app.read_note_in_background(&path_buf);
+            }
+            app.set_current_note_path(path_buf);
+        }
+        Command::ReadDir(path_buf) => {
+            let is_loaded = app.is_dir_in_storage(&path_buf);
+            if !is_loaded && !app.is_dir_pending(&path_buf) {
+                app.read_dir_in_background(&path_buf);
+            }
+        }
+        Command::CreateNote(path_buf) => todo!(),
+        Command::DeleteNote(path_buf) => todo!(),
+        Command::DeleteDir(path_buf) => todo!(),
+        Command::CreateNoteThenSelect(path_buf) => todo!(),
+        Command::CreateSubDir(path_buf) => todo!(),
+    }
 }
