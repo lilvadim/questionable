@@ -10,30 +10,30 @@ use crate::util::chrono::to_date_time_utc;
 
 #[derive(Debug, Clone)]
 pub struct DataNode<Value> {
-    pub path: PathBuf,
     pub data: Value,
-    pub creation_time: DateTime<Utc>,
-    pub modification_time: DateTime<Utc>,
-    pub deleted_metadata: Option<DeletedMetadata>,
     pub dirty: bool,
 }
 
-impl<V> DataNode<V> {
-    pub fn from_path_metadata(path: PathBuf, metadata: Metadata, value: V) -> Self {
+impl<T> DataNode<T> {
+    pub fn new(data: T) -> Self {
+        Self { data, dirty: false }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct FileMetadata {
+    pub creation_time: DateTime<Utc>,
+    pub modification_time: DateTime<Utc>,
+}
+
+impl FileMetadata {
+    pub fn from_path_metadata(metadata: Metadata) -> Self {
         let creation_time = to_date_time_utc(metadata.created().unwrap());
         let modification_time = to_date_time_utc(metadata.modified().unwrap());
         Self {
-            path,
-            data: value,
             creation_time,
             modification_time,
-            deleted_metadata: None,
-            dirty: false,
         }
-    }
-
-    pub fn is_deleted(&self) -> bool {
-        self.deleted_metadata.is_some()
     }
 }
 

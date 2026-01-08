@@ -7,26 +7,21 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
-use crate::data::{DataNode, Directory};
-use crate::note::{Note, SCRATCH_PAD_NAME};
+use crate::data::{DataNode, Directory, FileMetadata};
+use crate::note::Note;
 use crate::thread_pool::ThreadPoolExecutor;
 
 #[derive(Debug, Default)]
 pub struct FileMemory {
     pub dirs: HashMap<PathBuf, MemoryCell<DataNode<Directory>>>,
     pub notes: HashMap<PathBuf, MemoryCell<DataNode<Note>>>,
+    pub metadata: HashMap<PathBuf, MemoryCell<FileMetadata>>,
 }
 
 #[derive(Debug)]
 pub enum MemoryCell<T> {
     PendingRead,
     Value(T),
-}
-
-pub enum FileState {
-    PendingRead,
-    Saved,
-    Dirty,
 }
 
 impl<T> MemoryCell<T> {
@@ -62,7 +57,7 @@ impl Default for NotesLocationConfig {
     fn default() -> Self {
         let base_path: Rc<Path> = Rc::from(std::env::home_dir().unwrap().join("questionable"));
 
-        let scratch_pad_path: Rc<Path> = Rc::from(base_path.join(format!(".{SCRATCH_PAD_NAME}")));
+        let scratch_pad_path: Rc<Path> = Rc::from(base_path.join(format!(".scratchpad")));
 
         Self {
             base_path,
@@ -131,28 +126,18 @@ impl NonBlockingApplication {
     }
 
     fn load_dir(path: &Path) -> io::Result<DataNode<Directory>> {
-        Ok(DataNode::from_path_metadata(
-            path.to_owned(),
-            fs::metadata(path)?,
-            Directory::from_read_dir(fs::read_dir(path)?),
-        ))
+        Ok(DataNode::new(Directory::from_read_dir(fs::read_dir(path)?)))
     }
 
     fn load_note(path: &Path) -> io::Result<DataNode<Note>> {
-        Ok(DataNode::from_path_metadata(
-            path.to_owned(),
-            fs::metadata(path)?,
-            Note::from_text(fs::read_to_string(path)?),
-        ))
+        Ok(DataNode::new(Note::from_text(fs::read_to_string(path)?)))
     }
 
     fn save_note(path: &Path, note: &DataNode<Note>) -> io::Result<DataNode<Note>> {
         fs::write(path, &note.data.text)?;
-        Ok(DataNode::from_path_metadata(
-            path.to_owned(),
-            fs::metadata(path)?,
-            Note::from_text(fs::read_to_string(path)?),
-        ))
+        let mut note = note.clone();
+        note.dirty = false;
+        Ok(note)
     }
 
     pub fn get_note(&self, path: &Path) -> Option<&DataNode<Note>> {
