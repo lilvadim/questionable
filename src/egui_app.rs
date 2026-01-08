@@ -29,13 +29,15 @@ use egui::{
 
 #[derive(Debug)]
 pub enum Command {
-    SelectAndReadNote(PathBuf),
+    ReadAndSelectNote(PathBuf),
     ReadDir(PathBuf),
     CreateNote(PathBuf),
     DeleteNote(PathBuf),
     DeleteDir(PathBuf),
     CreateNoteThenSelect(PathBuf),
     CreateSubDir(PathBuf),
+    MarkChanged(PathBuf),
+    SaveNote(PathBuf),
 }
 
 pub struct NotesApp {
@@ -205,7 +207,7 @@ impl eframe::App for NotesApp {
                                 ctx.style().spacing.item_spacing.y as i8 * 2,
                             )),
                         )
-                        .show_inside(ui, |ui| Self::status_bar_ui(&self.app, ui));
+                        .show_inside(ui, |ui| Self::path_bar_ui(&self.app, ui));
                 }
 
                 // Draw Title and Editor
@@ -293,7 +295,7 @@ impl NotesApp {
                     {
                         let selected = app.is_selected(&app.scratch_pad_path());
                         if ui.add(scratch_pad_label(selected)).clicked() {
-                            command_queue.push_back(Command::SelectAndReadNote(
+                            command_queue.push_back(Command::ReadAndSelectNote(
                                 app.scratch_pad_path().to_path_buf(),
                             ));
                         }
@@ -322,7 +324,7 @@ impl NotesApp {
         });
     }
 
-    fn status_bar_ui(app: &NonBlockingApplication, ui: &mut Ui) {
+    fn path_bar_ui(app: &NonBlockingApplication, ui: &mut Ui) {
         let layout = Layout::left_to_right(Align::TOP).with_main_align(Align::LEFT);
         ui.with_layout(layout, |ui| {
             Label::new(RichText::new(app.current_note_path().to_string_lossy()))
@@ -380,20 +382,16 @@ impl NotesApp {
     // }
 
     fn note_content_ui(&mut self, ui: &mut Ui) {
-        let current_note_loaded = self.app.is_note_in_storage(&self.app.current_note_path());
+        let note_path = self.app.current_note_path().to_owned();
+        let current_note_loaded = self.app.note_in_memory(note_path.as_path());
         if !current_note_loaded {
-            self.command_queue.push_back(Command::SelectAndReadNote(
-                self.app.current_note_path().to_path_buf(),
-            ));
-        } else if let Some(current_note) = self
-            .app
-            .get_note_mut(&self.app.current_note_path().to_path_buf())
-        {
+            self.command_queue
+                .push_back(Command::ReadAndSelectNote(note_path.to_path_buf()));
+        } else if self.app.note_is_pending(note_path.as_path()) {
+            ui.label("Loading...");
+        } else if let Some(current_note) = self.app.get_note_mut(note_path.as_path()) {
             let _scroll_area = ScrollArea::both().stick_to_bottom(false).show(ui, |ui| {
                 ui.add_space(ui.spacing().item_spacing.y);
-
-                // self.title_ui(ui);
-                // ui.separator();
 
                 if TextEdit::multiline(&mut current_note.data.text)
                     .desired_width(f32::INFINITY)
@@ -406,7 +404,10 @@ impl NotesApp {
                     .ui(ui)
                     .changed()
                 {
-                    // TODO: Save
+                    self.command_queue
+                        .push_back(Command::MarkChanged(note_path.to_path_buf()));
+                    self.command_queue
+                        .push_back(Command::SaveNote(note_path.to_path_buf()));
                 }
             });
         }
@@ -476,7 +477,7 @@ fn explorer_note_label_ui(
         }
     });
     if label.clicked() && !selected {
-        commands.push_back(Command::SelectAndReadNote(note_path.to_path_buf()));
+        commands.push_back(Command::ReadAndSelectNote(note_path.to_path_buf()));
     }
     (label, commands)
 }
@@ -607,16 +608,12 @@ fn explorer_folder_content_ui(
 
 fn handle_command(app: &mut NonBlockingApplication, command: Command) {
     match command {
-        Command::SelectAndReadNote(path_buf) => {
-            let is_loaded = app.is_note_in_storage(&path_buf);
-            if !is_loaded && !app.is_note_pending(&path_buf) {
-                app.read_note_in_background(&path_buf);
-            }
+        Command::ReadAndSelectNote(path_buf) => {
+            app.read_note_in_background(&path_buf);
             app.set_current_note_path(path_buf);
         }
         Command::ReadDir(path_buf) => {
-            let is_loaded = app.is_dir_in_storage(&path_buf);
-            if !is_loaded && !app.is_dir_pending(&path_buf) {
+            if !app.dir_in_memory(&path_buf) {
                 app.read_dir_in_background(&path_buf);
             }
         }
@@ -625,5 +622,13 @@ fn handle_command(app: &mut NonBlockingApplication, command: Command) {
         Command::DeleteDir(path_buf) => todo!(),
         Command::CreateNoteThenSelect(path_buf) => todo!(),
         Command::CreateSubDir(path_buf) => todo!(),
+        Command::MarkChanged(path_buf) => {
+            app.set_dirty(&path_buf);
+        }
+        Command::SaveNote(path_buf) => {
+            if app.note_is_dirty(&path_buf) {
+                app.save_note_in_background(&path_buf);
+            }
+        }
     }
 }

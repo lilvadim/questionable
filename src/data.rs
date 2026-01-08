@@ -8,7 +8,7 @@ use chrono::{DateTime, Utc};
 
 use crate::util::chrono::to_date_time_utc;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DataNode<Value> {
     pub path: PathBuf,
     pub data: Value,
@@ -99,7 +99,7 @@ impl Directory {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DeletedMetadata {
     pub deletion_time: DateTime<Utc>,
     pub origin_path: PathBuf,

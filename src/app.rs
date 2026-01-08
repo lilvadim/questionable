@@ -1,24 +1,53 @@
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::fs::{self};
 use std::io;
 use std::ops::Not;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::mpsc::{Receiver, TryRecvError, channel};
+use std::sync::mpsc::{Receiver, Sender, channel};
 
 use crate::data::{DataNode, Directory};
 use crate::note::{Note, SCRATCH_PAD_NAME};
 use crate::thread_pool::ThreadPoolExecutor;
 
 #[derive(Debug, Default)]
-pub struct FileStorage {
-    pub dirs: HashMap<PathBuf, DataNode<Directory>>,
-    pub notes: HashMap<PathBuf, DataNode<Note>>,
+pub struct FileMemory {
+    pub dirs: HashMap<PathBuf, MemoryCell<DataNode<Directory>>>,
+    pub notes: HashMap<PathBuf, MemoryCell<DataNode<Note>>>,
+}
+
+#[derive(Debug)]
+pub enum MemoryCell<T> {
+    PendingRead,
+    Value(T),
+}
+
+pub enum FileState {
+    PendingRead,
+    Saved,
+    Dirty,
+}
+
+impl<T> MemoryCell<T> {
+    pub fn value(&self) -> Option<&T> {
+        match self {
+            Self::Value(value) => Some(value),
+            Self::PendingRead => None,
+        }
+    }
+
+    pub fn value_mut(&mut self) -> Option<&mut T> {
+        match self {
+            Self::Value(value) => Some(value),
+            Self::PendingRead => None,
+        }
+    }
 }
 
 #[derive(Debug)]
 pub struct ApplicationState {
-    pub storage: FileStorage,
+    pub memory: FileMemory,
     pub current_note_path: PathBuf,
     pub config: NotesLocationConfig,
 }
@@ -42,35 +71,13 @@ impl Default for NotesLocationConfig {
     }
 }
 
-#[derive(Debug)]
-pub struct PollableTask<Out> {
-    rx: Receiver<Out>,
-}
-
-pub enum PollState<Out> {
-    Pending,
-    Completed(Out),
-}
-
-impl<Out> PollableTask<Out> {
-    pub fn new(rx: Receiver<Out>) -> Self {
-        Self { rx }
-    }
-
-    pub fn poll(&self) -> PollState<Out> {
-        match self.rx.try_recv() {
-            Ok(value) => PollState::Completed(value),
-            Err(TryRecvError::Empty) => PollState::Pending,
-            Err(TryRecvError::Disconnected) => panic!("Should not be called"),
-        }
-    }
-}
-
 #[derive(Debug, Default)]
 struct BackgroundTasks {
-    read_note: HashMap<PathBuf, PollableTask<io::Result<DataNode<Note>>>>,
-    read_dir: HashMap<PathBuf, PollableTask<io::Result<DataNode<Directory>>>>,
+    notes: HashMap<PathBuf, Pipe<io::Result<DataNode<Note>>>>,
+    dirs: HashMap<PathBuf, Pipe<io::Result<DataNode<Directory>>>>,
 }
+
+type Pipe<T> = (Sender<T>, Receiver<T>);
 
 #[derive(Debug)]
 pub struct NonBlockingApplication {
@@ -89,7 +96,7 @@ impl NonBlockingApplication {
 
         Ok(Self {
             state: ApplicationState {
-                storage: Default::default(),
+                memory: Default::default(),
                 current_note_path: config.scratch_pad_path.to_path_buf(),
                 config,
             },
@@ -139,12 +146,21 @@ impl NonBlockingApplication {
         ))
     }
 
-    fn save_note(note: &DataNode<Note>) -> io::Result<()> {
-        fs::write(&note.path, &note.data.text)
+    fn save_note(path: &Path, note: &DataNode<Note>) -> io::Result<DataNode<Note>> {
+        fs::write(path, &note.data.text)?;
+        Ok(DataNode::from_path_metadata(
+            path.to_owned(),
+            fs::metadata(path)?,
+            Note::from_text(fs::read_to_string(path)?),
+        ))
     }
 
     pub fn get_note(&self, path: &Path) -> Option<&DataNode<Note>> {
-        self.state.storage.notes.get(path)
+        self.state
+            .memory
+            .notes
+            .get(path)
+            .and_then(MemoryCell::value)
     }
 
     pub fn scratch_pad(&self) -> Option<&DataNode<Note>> {
@@ -155,107 +171,164 @@ impl NonBlockingApplication {
         self.get_note_mut(&self.state.config.scratch_pad_path.clone())
     }
 
+    pub fn note_is_pending(&self, path: &Path) -> bool {
+        self.state
+            .memory
+            .notes
+            .get(path)
+            .and_then(MemoryCell::value)
+            .is_none()
+    }
+
     pub fn get_note_mut(&mut self, path: &Path) -> Option<&mut DataNode<Note>> {
-        self.state.storage.notes.get_mut(path)
+        self.state
+            .memory
+            .notes
+            .get_mut(path)
+            .and_then(MemoryCell::value_mut)
     }
 
     pub fn get_dir(&self, path: &Path) -> Option<&DataNode<Directory>> {
-        self.state.storage.dirs.get(path)
+        self.state.memory.dirs.get(path).and_then(MemoryCell::value)
     }
 
     pub fn poll_background_tasks(&mut self) {
-        self.poll_dir_load();
-        self.poll_notes_load();
+        self.poll_dir_tasks();
+        self.poll_notes_tasks();
     }
 
-    pub fn poll_notes_load(&mut self) {
-        let mut completed = vec![];
+    pub fn poll_notes_tasks(&mut self) {
         self.background_tasks
-            .read_note
-            .iter()
-            .for_each(|(path, task)| match task.poll() {
-                PollState::Completed(result) => match result {
+            .notes
+            .iter_mut()
+            .for_each(|(path, (_tx, rx))| {
+                rx.try_iter().for_each(|result| match result {
                     Ok(note) => {
-                        self.state.storage.notes.insert(path.to_owned(), note);
-                        completed.push(path.to_owned());
+                        self.state
+                            .memory
+                            .notes
+                            .insert(path.to_path_buf(), MemoryCell::Value(note));
                     }
-                    Err(error) => {
-                        self.error_msg.push(error.to_string());
-                        completed.push(path.to_owned());
+                    Err(err) => {
+                        self.error_msg.push(err.to_string());
                     }
-                },
-                _ => {}
+                })
             });
-        completed.into_iter().for_each(|path| {
-            self.background_tasks.read_note.remove(&path);
-        });
     }
 
-    pub fn poll_dir_load(&mut self) {
-        let mut completed = vec![];
+    pub fn poll_dir_tasks(&mut self) {
         self.background_tasks
-            .read_dir
-            .iter()
-            .for_each(|(path, task)| match task.poll() {
-                PollState::Completed(result) => match result {
-                    Ok(note) => {
-                        self.state.storage.dirs.insert(path.to_owned(), note);
-                        completed.push(path.to_owned());
+            .dirs
+            .iter_mut()
+            .for_each(|(path, (_tx, rx))| {
+                rx.try_iter().for_each(|result| match result {
+                    Ok(dir) => {
+                        self.state
+                            .memory
+                            .dirs
+                            .insert(path.to_path_buf(), MemoryCell::Value(dir));
                     }
-                    Err(error) => {
-                        self.error_msg.push(error.to_string());
-                        completed.push(path.to_owned());
+                    Err(err) => {
+                        self.error_msg.push(err.to_string());
                     }
-                },
-                _ => {}
+                })
             });
-        completed.into_iter().for_each(|path| {
-            self.background_tasks.read_dir.remove(&path);
-        });
     }
 
     pub fn read_note_in_background(&mut self, path: &Path) {
-        let (note_load_tx, note_load_rx) = channel();
+        if self.note_in_memory(path) {
+            return;
+        }
+
+        self.state
+            .memory
+            .notes
+            .insert(path.to_path_buf(), MemoryCell::PendingRead);
+
+        let result_pipe = match self.background_tasks.notes.entry(path.to_owned()) {
+            Entry::Vacant(entry) => entry.insert(channel()).0.clone(),
+            Entry::Occupied(entry) => entry.into_mut().0.clone(),
+        };
+
+        dbg!(&path);
+        self.async_execute_file_task(path, result_pipe, Self::load_note);
+    }
+
+    pub fn note_is_dirty(&self, path: &Path) -> bool {
+        self.state
+            .memory
+            .notes
+            .get(path)
+            .and_then(MemoryCell::value)
+            .map_or(false, |node| node.dirty)
+    }
+
+    pub fn note_in_memory(&self, path: &Path) -> bool {
+        self.state.memory.notes.contains_key(path)
+    }
+
+    pub fn set_dirty(&mut self, path: &Path) {
+        self.state
+            .memory
+            .notes
+            .get_mut(path)
+            .and_then(MemoryCell::value_mut)
+            .map(|node| {
+                node.dirty = true;
+            });
+    }
+
+    pub fn save_note_in_background(&mut self, path: &Path) {
+        let result_pipe = match self.background_tasks.notes.entry(path.to_owned()) {
+            Entry::Vacant(entry) => entry.insert(channel()).0.clone(),
+            Entry::Occupied(entry) => entry.into_mut().0.clone(),
+        };
+
+        let note = self
+            .state
+            .memory
+            .notes
+            .get(path)
+            .and_then(MemoryCell::value)
+            .unwrap()
+            .to_owned();
+
+        self.async_execute_file_task(path, result_pipe, move |path| Self::save_note(path, &note));
+    }
+
+    fn async_execute_file_task<T: Send + 'static>(
+        &self,
+        path: &Path,
+        result_pipe: Sender<io::Result<T>>,
+        task_fn: impl Fn(&Path) -> io::Result<T> + Send + 'static,
+    ) {
         let path_clone = path.to_path_buf();
-
         self.executor.execute(move || {
-            let load_result = Self::load_note(&path_clone);
-            note_load_tx.send(load_result).unwrap();
+            let parse_result = task_fn(&path_clone);
+            result_pipe.send(parse_result).unwrap();
         });
-
-        self.background_tasks
-            .read_note
-            .insert(path.to_path_buf(), PollableTask::new(note_load_rx));
     }
 
     pub fn read_dir_in_background(&mut self, path: &Path) {
-        let (dir_load_tx, dir_load_rx) = channel();
-        let path_clone = path.to_path_buf();
+        if self.dir_in_memory(path) {
+            return;
+        }
 
-        self.executor.execute(move || {
-            let load_result = Self::load_dir(&path_clone);
-            dir_load_tx.send(load_result).unwrap();
-        });
+        self.state
+            .memory
+            .dirs
+            .insert(path.to_path_buf(), MemoryCell::PendingRead);
 
-        self.background_tasks
-            .read_dir
-            .insert(path.to_path_buf(), PollableTask::new(dir_load_rx));
+        let result_pipe = match self.background_tasks.dirs.entry(path.to_owned()) {
+            Entry::Vacant(entry) => entry.insert(channel()).0.clone(),
+            Entry::Occupied(entry) => entry.into_mut().0.clone(),
+        };
+
+        self.async_execute_file_task(path, result_pipe, Self::load_dir);
     }
 
-    pub fn is_note_pending(&self, path: &Path) -> bool {
-        self.background_tasks.read_note.contains_key(path)
-    }
-
-    pub fn is_dir_pending(&self, path: &Path) -> bool {
-        self.background_tasks.read_dir.contains_key(path)
-    }
-
-    pub fn is_note_in_storage(&self, path: &Path) -> bool {
-        self.state.storage.notes.contains_key(path)
-    }
-
-    pub fn is_dir_in_storage(&self, path: &Path) -> bool {
-        self.state.storage.dirs.contains_key(path)
+    pub fn dir_in_memory(&self, path: &Path) -> bool {
+        self.state.memory.dirs.contains_key(path)
     }
 
     pub fn is_selected(&self, path: &Path) -> bool {

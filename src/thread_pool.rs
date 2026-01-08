@@ -10,7 +10,7 @@ type Executeable = Box<dyn FnOnce() + Send + 'static>;
 
 #[derive(Debug)]
 pub struct ThreadPoolExecutor {
-    request_send: Option<Sender<Executeable>>,
+    request_tx: Option<Sender<Executeable>>,
     workers: Vec<JoinHandle<()>>,
 }
 
@@ -22,27 +22,27 @@ impl Default for ThreadPoolExecutor {
 
 impl ThreadPoolExecutor {
     pub fn with_threads_cnt(threads_cnt: usize) -> Self {
-        let (request_send, request_recv) = channel();
+        let (request_tx, request_rx) = channel();
 
-        let request_recv = Arc::new(Mutex::new(request_recv));
+        let request_rx = Arc::new(Mutex::new(request_rx));
 
         let workers = (0..threads_cnt)
             .map(|_| {
-                let request_recv_clone = Arc::clone(&request_recv);
-                std::thread::spawn(move || Self::exec_loop(request_recv_clone))
+                let request_rx_clone = Arc::clone(&request_rx);
+                std::thread::spawn(move || Self::exec_loop(request_rx_clone))
             })
             .collect();
 
-        let request_send = Some(request_send);
+        let request_tx = Some(request_tx);
         Self {
-            request_send,
+            request_tx,
             workers,
         }
     }
 
-    fn exec_loop(request_recv: Arc<Mutex<Receiver<Executeable>>>) {
+    fn exec_loop(request_rx: Arc<Mutex<Receiver<Executeable>>>) {
         loop {
-            match request_recv.lock().unwrap().recv() {
+            match request_rx.lock().unwrap().recv() {
                 Ok(executable) => executable(),
                 Err(_) => break,
             }
@@ -50,7 +50,7 @@ impl ThreadPoolExecutor {
     }
 
     pub fn execute(&self, task: impl FnOnce() + Send + 'static) {
-        self.request_send
+        self.request_tx
             .as_ref()
             .unwrap()
             .send(Box::new(task))
@@ -60,7 +60,7 @@ impl ThreadPoolExecutor {
 
 impl Drop for ThreadPoolExecutor {
     fn drop(&mut self) {
-        std::mem::drop(self.request_send.take());
+        std::mem::drop(self.request_tx.take());
         self.workers
             .drain(..)
             .for_each(|thread| thread.join().unwrap());
