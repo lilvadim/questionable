@@ -1,8 +1,6 @@
 mod app;
 mod data;
 mod egui_app;
-mod font_icons;
-mod note;
 mod thread_pool;
 mod util;
 

@@ -1,16 +1,17 @@
+use crate::app::ApplicationConfig;
+use crate::app::MemoryCellState;
 use crate::app::NonBlockingApplication;
-use crate::app::NotesLocationConfig;
 use crate::data::DataNode;
 use crate::data::DirEntry;
 use crate::data::Directory;
-use crate::font_icons::phosphor;
-use crate::note::DEFAULT_ICON;
-use crate::note::Note;
-use crate::note::SCRATCH_PAD_ICON;
-use crate::note::SCRATCH_PAD_NAME;
 use crate::util::chrono::to_local_date_time;
 use egui::CollapsingHeader;
 use egui::Popup;
+use notes::DEFAULT_ICON;
+use notes::Note;
+use notes::SCRATCH_PAD_ICON;
+use notes::SCRATCH_PAD_NAME;
+use phosphor_icons;
 use rust_i18n::t;
 
 use std::collections::VecDeque;
@@ -74,8 +75,7 @@ impl Default for UiState {
 /// Create demo instance
 impl NotesApp {
     pub fn init() -> Self {
-        let app = NonBlockingApplication::init(NotesLocationConfig::default()).unwrap();
-        // state.scratch_pad_mut().text = gen_sample_text(100);
+        let app = NonBlockingApplication::init(ApplicationConfig::default()).unwrap();
         Self {
             app,
             command_queue: Default::default(),
@@ -383,33 +383,41 @@ impl NotesApp {
 
     fn note_content_ui(&mut self, ui: &mut Ui) {
         let note_path = self.app.current_note_path().to_owned();
-        let current_note_loaded = self.app.note_in_memory(note_path.as_path());
-        if !current_note_loaded {
-            self.command_queue
-                .push_back(Command::ReadAndSelectNote(note_path.to_path_buf()));
-        } else if self.app.note_is_pending(note_path.as_path()) {
-            ui.label("Loading...");
-        } else if let Some(current_note) = self.app.get_note_mut(note_path.as_path()) {
-            let _scroll_area = ScrollArea::both().stick_to_bottom(false).show(ui, |ui| {
-                ui.add_space(ui.spacing().item_spacing.y);
+        let note_state = self.app.note_state(&note_path);
+        match note_state {
+            Some(MemoryCellState::Ready) => {
+                let current_note = self.app.get_note_mut(&note_path).unwrap();
+                let _scroll_area = ScrollArea::both().stick_to_bottom(false).show(ui, |ui| {
+                    ui.add_space(ui.spacing().item_spacing.y);
 
-                if TextEdit::multiline(&mut current_note.data.text)
-                    .desired_width(f32::INFINITY)
-                    .font(TextStyle::Body)
-                    .background_color(ui.visuals().panel_fill)
-                    .lock_focus(true)
-                    .desired_rows(5)
-                    .clip_text(false)
-                    .frame(false)
-                    .ui(ui)
-                    .changed()
-                {
-                    self.command_queue
-                        .push_back(Command::MarkChanged(note_path.to_path_buf()));
-                    self.command_queue
-                        .push_back(Command::SaveNote(note_path.to_path_buf()));
-                }
-            });
+                    if TextEdit::multiline(&mut current_note.data.text)
+                        .desired_width(f32::INFINITY)
+                        .font(TextStyle::Body)
+                        .background_color(ui.visuals().panel_fill)
+                        .lock_focus(true)
+                        .desired_rows(5)
+                        .clip_text(false)
+                        .frame(false)
+                        .ui(ui)
+                        .changed()
+                    {
+                        self.command_queue
+                            .push_back(Command::MarkChanged(note_path.to_path_buf()));
+                        self.command_queue
+                            .push_back(Command::SaveNote(note_path.to_path_buf()));
+                    }
+                });
+            }
+            Some(MemoryCellState::PendingRead) => {
+                ui.label("Loading...");
+            }
+            Some(MemoryCellState::Error) => {
+                todo!("Display IO Error")
+            }
+            None => {
+                self.command_queue
+                    .push_back(Command::ReadAndSelectNote(note_path.to_path_buf()));
+            }
         }
     }
 

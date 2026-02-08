@@ -8,8 +8,8 @@ use std::rc::Rc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
 use crate::data::{DataNode, Directory, FileMetadata};
-use crate::note::Note;
 use crate::thread_pool::ThreadPoolExecutor;
+use notes::Note;
 
 #[derive(Debug, Default)]
 pub struct FileMemory {
@@ -21,21 +21,41 @@ pub struct FileMemory {
 #[derive(Debug)]
 pub enum MemoryCell<T> {
     PendingRead,
+    ReadError(io::Error),
+    ValueWriteError(T, io::Error),
     Value(T),
+}
+
+#[derive(Debug)]
+pub enum MemoryCellState {
+    PendingRead,
+    Ready,
+    Error,
+}
+
+impl MemoryCellState {
+    pub fn state_of_cell<T>(cell: &MemoryCell<T>) -> Self {
+        match cell {
+            MemoryCell::PendingRead
+            | MemoryCell::ReadError(_)
+            | MemoryCell::ValueWriteError(..) => Self::PendingRead,
+            MemoryCell::Value(_) => Self::Ready,
+        }
+    }
 }
 
 impl<T> MemoryCell<T> {
     pub fn value(&self) -> Option<&T> {
         match self {
-            Self::Value(value) => Some(value),
-            Self::PendingRead => None,
+            Self::Value(value) | Self::ValueWriteError(value, _) => Some(value),
+            Self::PendingRead | Self::ReadError(_) => None,
         }
     }
 
     pub fn value_mut(&mut self) -> Option<&mut T> {
         match self {
-            Self::Value(value) => Some(value),
-            Self::PendingRead => None,
+            Self::Value(value) | Self::ValueWriteError(value, _) => Some(value),
+            Self::PendingRead | Self::ReadError(_) => None,
         }
     }
 }
@@ -44,16 +64,31 @@ impl<T> MemoryCell<T> {
 pub struct ApplicationState {
     pub memory: FileMemory,
     pub current_note_path: PathBuf,
-    pub config: NotesLocationConfig,
+    pub config: ApplicationConfig,
 }
 
-#[derive(Debug)]
-pub struct NotesLocationConfig {
+#[derive(Debug, Clone)]
+pub struct ApplicationConfig {
+    pub location: LocationConfig,
+    pub autosave: bool,
+}
+
+impl Default for ApplicationConfig {
+    fn default() -> Self {
+        Self {
+            location: Default::default(),
+            autosave: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct LocationConfig {
     pub base_path: Rc<Path>,
     pub scratch_pad_path: Rc<Path>,
 }
 
-impl Default for NotesLocationConfig {
+impl Default for LocationConfig {
     fn default() -> Self {
         let base_path: Rc<Path> = Rc::from(std::env::home_dir().unwrap().join("questionable"));
 
@@ -79,30 +114,24 @@ pub struct NonBlockingApplication {
     state: ApplicationState,
     executor: ThreadPoolExecutor,
     background_tasks: BackgroundTasks,
-    error_msg: Vec<String>,
 }
 
 impl NonBlockingApplication {
-    pub fn init(config: NotesLocationConfig) -> io::Result<Self> {
-        fs::create_dir_all(&config.base_path)?;
-        if config.scratch_pad_path.try_exists()?.not() {
-            fs::write(&config.scratch_pad_path, "")?;
+    pub fn init(config: ApplicationConfig) -> io::Result<Self> {
+        fs::create_dir_all(&config.location.base_path)?;
+        if config.location.scratch_pad_path.try_exists()?.not() {
+            fs::write(&config.location.scratch_pad_path, "")?;
         }
 
         Ok(Self {
             state: ApplicationState {
                 memory: Default::default(),
-                current_note_path: config.scratch_pad_path.to_path_buf(),
+                current_note_path: config.location.scratch_pad_path.to_path_buf(),
                 config,
             },
             executor: Default::default(),
-            error_msg: Default::default(),
             background_tasks: Default::default(),
         })
-    }
-
-    pub fn pop_errors(&mut self) -> Vec<String> {
-        self.error_msg.drain(..).collect()
     }
 
     pub fn current_note_path(&self) -> &Path {
@@ -114,11 +143,11 @@ impl NonBlockingApplication {
     }
 
     pub fn base_dir_path(&self) -> &Path {
-        &self.state.config.base_path
+        &self.state.config.location.base_path
     }
 
     pub fn scratch_pad_path(&self) -> &Path {
-        &self.state.config.scratch_pad_path
+        &self.state.config.location.scratch_pad_path
     }
 
     pub fn base_dir(&self) -> Option<&DataNode<Directory>> {
@@ -141,19 +170,27 @@ impl NonBlockingApplication {
     }
 
     pub fn get_note(&self, path: &Path) -> Option<&DataNode<Note>> {
+        self.get_note_cell(path).and_then(MemoryCell::value)
+    }
+
+    pub fn get_note_cell(&self, path: &Path) -> Option<&MemoryCell<DataNode<Note>>> {
+        self.state.memory.notes.get(path)
+    }
+
+    pub fn note_state(&self, path: &Path) -> Option<MemoryCellState> {
         self.state
             .memory
             .notes
             .get(path)
-            .and_then(MemoryCell::value)
+            .map(MemoryCellState::state_of_cell)
     }
 
     pub fn scratch_pad(&self) -> Option<&DataNode<Note>> {
-        self.get_note(&self.state.config.scratch_pad_path)
+        self.get_note(&self.scratch_pad_path())
     }
 
     pub fn scratch_pad_mut(&mut self) -> Option<&mut DataNode<Note>> {
-        self.get_note_mut(&self.state.config.scratch_pad_path.clone())
+        self.get_note_mut(&self.scratch_pad_path().to_owned())
     }
 
     pub fn note_is_pending(&self, path: &Path) -> bool {
@@ -195,7 +232,7 @@ impl NonBlockingApplication {
                             .insert(path.to_path_buf(), MemoryCell::Value(note));
                     }
                     Err(err) => {
-                        self.error_msg.push(err.to_string());
+                        todo!()
                     }
                 })
             });
@@ -214,7 +251,7 @@ impl NonBlockingApplication {
                             .insert(path.to_path_buf(), MemoryCell::Value(dir));
                     }
                     Err(err) => {
-                        self.error_msg.push(err.to_string());
+                        todo!()
                     }
                 })
             });

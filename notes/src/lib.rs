@@ -1,14 +1,13 @@
-use crate::font_icons::phosphor;
+pub const DEFAULT_ICON: &str = phosphor_icons::NOTE;
+pub const SCRATCH_PAD_ICON: &str = phosphor_icons::PENCIL_LINE;
 
 pub const DEFAULT_FOLDER_NAME: &str = "Some folder";
 pub const DEFAULT_ROOT_NAME: &str = "notes";
 pub const DEFAULT_TRASH_NAME: &str = "trash";
 
-pub const DEFAULT_ICON: &str = phosphor::NOTE;
 pub const DEFAULT_NAME: &str = "a note";
 pub const DEFAULT_TITLE: &str = "Some new note title";
 
-pub const SCRATCH_PAD_ICON: &str = phosphor::PENCIL_LINE;
 pub const SCRATCH_PAD_NAME: &str = "Scratch Pad";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
