@@ -105,21 +105,21 @@ impl eframe::App for NotesApp {
             .show(ctx, |ui| {
                 ui.horizontal_top(|ui| {
                     if (ui.input(|i| i.modifiers.ctrl) || self.ui_state.egui_settings)
-                        && Button::selectable(self.ui_state.egui_settings, phosphor::WRENCH)
+                        && Button::selectable(self.ui_state.egui_settings, phosphor_icons::WRENCH)
                             .ui(ui)
                             .on_hover_text("Egui Tweaks")
                             .clicked()
                     {
                         self.ui_state.egui_settings = !self.ui_state.egui_settings;
                     }
-                    if Button::selectable(self.ui_state.explorer, phosphor::LIST_DASHES)
+                    if Button::selectable(self.ui_state.explorer, phosphor_icons::LIST_DASHES)
                         .ui(ui)
                         .on_hover_text(t!("explorer"))
                         .clicked()
                     {
                         self.ui_state.explorer = !self.ui_state.explorer
                     }
-                    if Button::selectable(self.ui_state.trash, phosphor::TRASH)
+                    if Button::selectable(self.ui_state.trash, phosphor_icons::TRASH)
                         .ui(ui)
                         .on_hover_text(t!("trash"))
                         .clicked()
@@ -149,7 +149,7 @@ impl eframe::App for NotesApp {
                             ui.horizontal(|ui| {
                                 let default_item_spacing = ui.spacing_mut().item_spacing.x;
                                 ui.spacing_mut().item_spacing.x = 0.;
-                                if Button::new(phosphor::X)
+                                if Button::new(phosphor_icons::X)
                                     .ui(ui)
                                     .on_hover_text("Hide")
                                     .clicked()
@@ -159,7 +159,7 @@ impl eframe::App for NotesApp {
                                 ui.add_space(default_item_spacing / 2.);
                                 ui.spacing_mut().item_spacing.x = default_item_spacing;
 
-                                if Button::new(phosphor::SIDEBAR)
+                                if Button::new(phosphor_icons::SIDEBAR)
                                     .ui(ui)
                                     .on_hover_text("To side bar")
                                     .clicked()
@@ -169,7 +169,7 @@ impl eframe::App for NotesApp {
                                 ui.add(
                                     Label::new(format!(
                                         "{} {}",
-                                        phosphor::LIST_DASHES,
+                                        phosphor_icons::LIST_DASHES,
                                         t!("explorer")
                                     ))
                                     .selectable(false),
@@ -181,7 +181,7 @@ impl eframe::App for NotesApp {
                 ExplorerLayout::SideBar => {
                     egui::SidePanel::new(Side::Left, "explorer_side_bar").show(ctx, |ui| {
                         ui.add_space(ui.spacing().icon_spacing);
-                        if Button::new(phosphor::CARDS)
+                        if Button::new(phosphor_icons::CARDS)
                             .ui(ui)
                             .on_hover_text("To window")
                             .clicked()
@@ -477,7 +477,7 @@ fn explorer_note_label_ui(
     let label = ui.add(note_label(selected, note_name_in_dir));
     label.context_menu(|ui| {
         if ui
-            .button(format!("{} {}", phosphor::TRASH, t!("trash_note")))
+            .button(format!("{} {}", phosphor_icons::TRASH, t!("trash_note")))
             .clicked()
         {
             commands.push_back(Command::DeleteNote(note_path.to_path_buf()));
@@ -513,13 +513,13 @@ fn scratch_pad_label<'x>(selected: bool) -> Button<'x> {
 fn create_action_buttons_ui(ui: &mut Ui, dir_path: &Path) -> Option<Command> {
     let mut action = None;
     if ui
-        .button(format!("{} {}", phosphor::PLUS, t!("new_note")))
+        .button(format!("{} {}", phosphor_icons::PLUS, t!("new_note")))
         .clicked()
     {
         action = Command::CreateNoteThenSelect(dir_path.to_path_buf()).into();
     }
     if ui
-        .button(format!("{} {}", phosphor::PLUS, t!("new_folder")))
+        .button(format!("{} {}", phosphor_icons::PLUS, t!("new_folder")))
         .clicked()
     {
         action = Command::CreateSubDir(dir_path.to_path_buf()).into()
@@ -530,7 +530,7 @@ fn create_action_buttons_ui(ui: &mut Ui, dir_path: &Path) -> Option<Command> {
 fn dir_action_buttons_ui(ui: &mut Ui, dir_path: &Path) -> Option<Command> {
     let mut action = create_action_buttons_ui(ui, dir_path);
     if ui
-        .button(format!("{} {}", phosphor::TRASH, t!("trash_note")))
+        .button(format!("{} {}", phosphor_icons::TRASH, t!("trash_note")))
         .clicked()
     {
         action = Some(Command::DeleteDir(dir_path.to_path_buf()));
